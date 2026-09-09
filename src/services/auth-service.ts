@@ -19,10 +19,13 @@ let pendingVerification: VerificationResponse | null = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let pendingAuth: any = null;
 let tokenRefreshInterval: NodeJS.Timeout | null = null;
+// De-duplicates concurrent refreshes so a burst of Claude Code requests only
+// triggers a single call to GitHub.
+let refreshPromise: Promise<CopilotToken> | null = null;
 
 // Ensure token storage directory exists
 if (!fs.existsSync(TOKEN_STORAGE_DIR)) {
-  fs.mkdirSync(TOKEN_STORAGE_DIR, { recursive: true });
+  fs.mkdirSync(TOKEN_STORAGE_DIR, { recursive: true, mode: 0o700 });
 }
 
 /**
@@ -63,7 +66,7 @@ export function loadPersistedTokens(): void {
  */
 function saveGithubToken(token: string): void {
   try {
-    fs.writeFileSync(GITHUB_TOKEN_FILE, JSON.stringify({ token }), 'utf-8');
+    fs.writeFileSync(GITHUB_TOKEN_FILE, JSON.stringify({ token }), { encoding: 'utf-8', mode: 0o600 });
     logger.debug('GitHub token saved to persistent storage');
   } catch (error) {
     logger.error('Error saving GitHub token:', error);
@@ -75,7 +78,7 @@ function saveGithubToken(token: string): void {
  */
 function saveCopilotToken(token: CopilotToken): void {
   try {
-    fs.writeFileSync(COPILOT_TOKEN_FILE, JSON.stringify(token), 'utf-8');
+    fs.writeFileSync(COPILOT_TOKEN_FILE, JSON.stringify(token), { encoding: 'utf-8', mode: 0o600 });
     logger.debug('Copilot token saved to persistent storage');
   } catch (error) {
     logger.error('Error saving Copilot token:', error);
@@ -253,9 +256,11 @@ export async function refreshCopilotToken(): Promise<CopilotToken> {
     const response = await fetch(config.github.copilot.apiEndpoints.GITHUB_COPILOT_TOKEN, {
       method: 'GET',
       headers: {
-        'Authorization': `token ${githubToken}`,
-        'Editor-Version': 'Cursor-IDE/1.0.0',
-        'Editor-Plugin-Version': 'copilot-cursor/1.0.0'
+        'Authorization': 'token ' + githubToken,
+        'Accept': 'application/json',
+        'Editor-Version': config.copilot.editorVersion,
+        'Editor-Plugin-Version': config.copilot.pluginVersion,
+        'User-Agent': config.copilot.userAgent
       }
     });
 
@@ -274,6 +279,31 @@ export async function refreshCopilotToken(): Promise<CopilotToken> {
     logger.error('Error refreshing Copilot token:', error);
     throw error;
   }
+}
+
+/**
+ * Ensure a usable Copilot token is available, refreshing it when the cached
+ * one has expired. Concurrent callers share a single refresh.
+ *
+ * @returns Promise<CopilotToken> A valid Copilot token
+ * @throws When no GitHub token is stored or the refresh fails
+ */
+export async function ensureCopilotToken(): Promise<CopilotToken> {
+  if (isTokenValid() && copilotToken) {
+    return copilotToken;
+  }
+
+  if (!githubToken) {
+    throw new Error('Not authenticated with GitHub');
+  }
+
+  if (!refreshPromise) {
+    refreshPromise = refreshCopilotToken().finally(() => {
+      refreshPromise = null;
+    });
+  }
+
+  return refreshPromise;
 }
 
 /**
