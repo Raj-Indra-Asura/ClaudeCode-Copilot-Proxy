@@ -739,7 +739,12 @@ export async function* streamAnthropicMessage(
 
   yield* convertCopilotStreamToAnthropicEvents(
     parseCopilotSseStream(response.body as NodeJS.ReadableStream),
-    { messageId, model: request.model, toolNameMap }
+    {
+      messageId,
+      model: request.model,
+      toolNameMap,
+      estimatedInputTokens: estimateInputTokens(request.messages, request.system, request.tools),
+    }
   );
 }
 
@@ -754,12 +759,17 @@ export async function* streamAnthropicMessage(
  */
 export async function* convertCopilotStreamToAnthropicEvents(
   chunks: AsyncIterable<CopilotChatStreamChunk>,
-  options: { messageId: string; model: string; toolNameMap?: Map<string, string> }
+  options: {
+    messageId: string;
+    model: string;
+    toolNameMap?: Map<string, string>;
+    estimatedInputTokens?: number;
+  }
 ): AsyncGenerator<AnthropicStreamEvent> {
   const { messageId, model } = options;
   const toolNameMap = options.toolNameMap ?? new Map<string, string>();
 
-  let inputTokens = 0;
+  let inputTokens = options.estimatedInputTokens ?? 0;
   let outputTokens = 0;
   let startedMessage = false;
   let textBlockIndex: number | null = null;

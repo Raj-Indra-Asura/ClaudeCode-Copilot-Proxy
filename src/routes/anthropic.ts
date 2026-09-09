@@ -49,7 +49,11 @@ const requireAuth = async (
     await ensureCopilotToken();
     return next();
   } catch (error) {
-    logger.error('Copilot authentication unavailable:', error);
+    logger.warn(
+      `Copilot authentication unavailable: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
     return res
       .status(401)
       .json(
@@ -169,7 +173,7 @@ anthropicRoutes.post('/messages', requireAuth, async (req, res) => {
   trackRequest(sessionId, 0);
 
   if (request.stream) {
-    return handleStreamingMessage(req, res, request, copilotToken.token, sessionId);
+    return handleStreamingMessage(res, request, copilotToken.token, sessionId);
   }
 
   try {
@@ -194,15 +198,18 @@ function writeEvent(res: express.Response, event: AnthropicStreamEvent): void {
  * Stream a response to Claude Code in Anthropic SSE format.
  */
 async function handleStreamingMessage(
-  req: express.Request,
   res: express.Response,
   request: AnthropicMessageRequest,
   copilotToken: string,
   sessionId: string
 ): Promise<void> {
   let clientGone = false;
-  req.on('close', () => {
-    clientGone = true;
+  // Listen on the response, not the request: `req` emits 'close' as soon as
+  // its body has been consumed, which would abort every stream immediately.
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientGone = true;
+    }
   });
 
   try {
