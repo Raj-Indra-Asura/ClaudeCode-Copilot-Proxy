@@ -737,6 +737,28 @@ export async function* streamAnthropicMessage(
     throw new CopilotApiError(502, 'Copilot returned an empty streaming response');
   }
 
+  yield* convertCopilotStreamToAnthropicEvents(
+    parseCopilotSseStream(response.body as NodeJS.ReadableStream),
+    { messageId, model: request.model, toolNameMap }
+  );
+}
+
+/**
+ * Convert a stream of Copilot chat chunks into a well-formed Anthropic SSE
+ * event sequence.
+ *
+ * Content blocks are opened and closed in order, tool call argument fragments
+ * are forwarded as `input_json_delta` events, and a text block is always
+ * emitted even when the model returns nothing, because Anthropic clients
+ * reject messages with no content blocks.
+ */
+export async function* convertCopilotStreamToAnthropicEvents(
+  chunks: AsyncIterable<CopilotChatStreamChunk>,
+  options: { messageId: string; model: string; toolNameMap?: Map<string, string> }
+): AsyncGenerator<AnthropicStreamEvent> {
+  const { messageId, model } = options;
+  const toolNameMap = options.toolNameMap ?? new Map<string, string>();
+
   let inputTokens = 0;
   let outputTokens = 0;
   let startedMessage = false;
@@ -757,7 +779,7 @@ export async function* streamAnthropicMessage(
         type: 'message',
         role: 'assistant',
         content: [],
-        model: request.model,
+        model,
         stop_reason: null,
         stop_sequence: null,
         usage: { input_tokens: inputTokens, output_tokens: 0 },
@@ -765,7 +787,7 @@ export async function* streamAnthropicMessage(
     };
   };
 
-  for await (const chunk of parseCopilotSseStream(response.body as NodeJS.ReadableStream)) {
+  for await (const chunk of chunks) {
     if (chunk.usage) {
       inputTokens = chunk.usage.prompt_tokens ?? inputTokens;
       outputTokens = chunk.usage.completion_tokens ?? outputTokens;
