@@ -10,7 +10,92 @@ import {
   COPILOT_ANTHROPIC_MODELS,
   config,
 } from '../config/index.js';
+import {
+  CatalogModel,
+  findCatalogModel,
+  getCatalogSnapshot,
+  getClaudeCatalogModels,
+} from '../services/model-catalog.js';
 import { AnthropicModel, AnthropicModelList } from '../types/anthropic.js';
+
+/** Claude model families, in the order used to pick a generic fallback. */
+const CLAUDE_FAMILIES = ['opus', 'sonnet', 'haiku', 'fable'] as const;
+
+/** Suffixes that mark a variant, so the plain model of a family wins ties. */
+const VARIANT_SUFFIX = /-(fast|thinking|preview|latest)$/;
+
+/**
+ * Extract the family keyword (`opus`, `sonnet`, ...) from a model name.
+ */
+function detectFamily(model: string): string | undefined {
+  return CLAUDE_FAMILIES.find((family) => model.includes(family));
+}
+
+/**
+ * Rank a catalog model within its family: newest version first, plain variants
+ * before `-fast`/`-thinking` ones.
+ */
+function familyRank(model: CatalogModel): [number, number] {
+  const versions = (model.id.match(/\d+(?:\.\d+)?/g) ?? []).map(Number);
+  const version = versions.length > 0 ? Math.max(...versions) : 0;
+  return [version, VARIANT_SUFFIX.test(model.id) ? 0 : 1];
+}
+
+/**
+ * Best live model of a family, or undefined when the account has none.
+ */
+function bestCatalogModelForFamily(family: string | undefined): CatalogModel | undefined {
+  const candidates = getClaudeCatalogModels().filter((model) =>
+    family ? model.id.toLowerCase().includes(family) : true
+  );
+
+  return candidates.sort((a, b) => {
+    const [versionA, plainA] = familyRank(a);
+    const [versionB, plainB] = familyRank(b);
+    return versionB - versionA || plainB - plainA || a.id.localeCompare(b.id);
+  })[0];
+}
+
+/**
+ * The model unrecognised Claude identifiers fall back to.
+ *
+ * `DEFAULT_CLAUDE_MODEL` wins whenever the account can actually serve it;
+ * otherwise the newest live Sonnet is used, so a retired default cannot break
+ * a session.
+ */
+function resolveDefaultModel(): string {
+  const configured = config.anthropic.defaultModel;
+
+  if (getCatalogSnapshot().length === 0 || findCatalogModel(configured)) {
+    return configured;
+  }
+
+  return (
+    bestCatalogModelForFamily(detectFamily(configured.toLowerCase()) ?? 'sonnet')?.id ??
+    bestCatalogModelForFamily(undefined)?.id ??
+    configured
+  );
+}
+
+/**
+ * Reconcile a statically mapped model with what the account can actually use.
+ *
+ * With no catalog loaded (offline, or before authentication) the static mapping
+ * is returned unchanged, preserving the previous behaviour.
+ */
+function reconcileWithCatalog(candidate: string, requested: string): string {
+  if (getCatalogSnapshot().length === 0) {
+    return candidate;
+  }
+
+  const live = findCatalogModel(candidate);
+  if (live) {
+    return live.id;
+  }
+
+  const family = detectFamily(requested) ?? detectFamily(candidate.toLowerCase());
+  return bestCatalogModelForFamily(family)?.id ?? resolveDefaultModel();
+}
 
 /**
  * Map a model name to the Copilot model name.
@@ -25,25 +110,32 @@ import { AnthropicModel, AnthropicModelList } from '../types/anthropic.js';
  */
 export function mapClaudeModelToCopilot(model: string): string {
   if (!model) {
-    return config.anthropic.defaultModel;
+    return resolveDefaultModel();
   }
 
   const normalized = model.trim().toLowerCase();
 
-  // A live Copilot model ID is forwarded verbatim. Checked before prefix
+  // Anything the account actually offers is forwarded verbatim, so selecting
+  // any Copilot model ID from /v1/models works without a mapping entry.
+  const live = findCatalogModel(normalized);
+  if (live) {
+    return live.id;
+  }
+
+  // A known Copilot model ID is forwarded verbatim. Checked before prefix
   // matching so 'claude-opus-4.7' is not rewritten by the 'claude-opus-4' key.
   if (COPILOT_ANTHROPIC_MODELS.includes(normalized)) {
-    return normalized;
+    return reconcileWithCatalog(normalized, normalized);
   }
 
   const direct = CLAUDE_MODEL_MAPPINGS[normalized];
   if (direct) {
-    return direct;
+    return reconcileWithCatalog(direct, normalized);
   }
 
   // Already a Copilot model identifier (e.g. "claude-sonnet-5").
   if (Object.values(CLAUDE_MODEL_MAPPINGS).includes(normalized)) {
-    return normalized;
+    return reconcileWithCatalog(normalized, normalized);
   }
 
   // Longest matching prefix wins so dated suffixes resolve correctly.
@@ -52,13 +144,14 @@ export function mapClaudeModelToCopilot(model: string): string {
     .sort((a, b) => b.length - a.length)[0];
 
   if (prefixMatch) {
-    return CLAUDE_MODEL_MAPPINGS[prefixMatch];
+    return reconcileWithCatalog(CLAUDE_MODEL_MAPPINGS[prefixMatch], normalized);
   }
 
-  // Unknown Claude variants fall back to the configured default so Claude Code
-  // never fails outright on a model rename.
+  // Unknown Claude variants resolve to the newest live model of the same
+  // family, or the default, so Claude Code never fails outright on a rename.
   if (normalized.startsWith('claude')) {
-    return config.anthropic.defaultModel;
+    const family = detectFamily(normalized);
+    return (family && bestCatalogModelForFamily(family)?.id) || resolveDefaultModel();
   }
 
   // Non-Claude models (GPT, Gemini, ...) pass through untouched.
@@ -77,6 +170,10 @@ export function isValidClaudeModel(model: string): boolean {
   }
 
   const normalized = model.trim().toLowerCase();
+
+  if (findCatalogModel(normalized)?.isClaude) {
+    return true;
+  }
 
   if (COPILOT_ANTHROPIC_MODELS.includes(normalized)) {
     return true;
@@ -106,11 +203,38 @@ function toAnthropicModel(model: { id: string; display_name: string }): Anthropi
 }
 
 /**
+ * Models to advertise: every model the account can actually use, falling back
+ * to the static list when the catalog has not been loaded.
+ *
+ * Copilot's own picker flag is honoured so retired-but-still-served IDs stay
+ * out of Claude Code's `/model` list, unless that would leave it empty.
+ */
+function listAdvertisedModels(): AnthropicModel[] {
+  const snapshot = getCatalogSnapshot();
+
+  if (snapshot.length > 0) {
+    const scoped = config.anthropic.exposeAllModels
+      ? snapshot
+      : snapshot.filter((model) => model.isClaude);
+    const picked = scoped.filter((model) => model.pickerEnabled);
+    const exposed = picked.length > 0 ? picked : scoped;
+
+    if (exposed.length > 0) {
+      return exposed.map((model) =>
+        toAnthropicModel({ id: model.id, display_name: model.displayName })
+      );
+    }
+  }
+
+  return AVAILABLE_CLAUDE_MODELS.map(toAnthropicModel);
+}
+
+/**
  * Get the list of available models for the `/v1/models` endpoint, in
  * Anthropic's pagination envelope.
  */
 export function getAvailableModels(): AnthropicModelList {
-  const models: AnthropicModel[] = AVAILABLE_CLAUDE_MODELS.map(toAnthropicModel);
+  const models = listAdvertisedModels();
 
   return {
     data: models,
@@ -126,6 +250,11 @@ export function getAvailableModels(): AnthropicModelList {
  * @returns The model entry, or null when the model is not recognised
  */
 export function getModelById(modelId: string): AnthropicModel | null {
+  const live = findCatalogModel(modelId);
+  if (live) {
+    return toAnthropicModel({ id: live.id, display_name: live.displayName });
+  }
+
   const found = AVAILABLE_CLAUDE_MODELS.find(
     (model) => model.id === modelId || model.copilot_model === modelId
   );
@@ -149,6 +278,11 @@ export function getModelById(modelId: string): AnthropicModel | null {
  * @returns Human-readable display name
  */
 export function getModelDisplayName(model: string): string {
+  const live = findCatalogModel(model);
+  if (live) {
+    return live.displayName;
+  }
+
   const found = AVAILABLE_CLAUDE_MODELS.find(
     (m) => m.id === model || m.copilot_model === model
   );

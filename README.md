@@ -343,10 +343,30 @@ tuning.
 
 ### Supported models
 
-GitHub Copilot does **not** serve Anthropic's public model names, and it retires
-model IDs quickly. Claude Code's identifiers (including dated ones such as
-`claude-sonnet-4-5-20250929` and the `sonnet` / `opus` / `haiku` / `opusplan`
-aliases) are therefore mapped onto whatever Copilot currently serves:
+`GET /v1/models` is answered from your **live Copilot catalog** — the proxy calls
+Copilot's own `/models` endpoint with your token and advertises every Claude
+model your plan can actually serve (Pro+ accounts see the full Opus / Sonnet /
+Haiku range), refreshing it every 10 minutes. Nothing is hardcoded, so a model
+that GitHub adds or retires shows up without a code change.
+
+```bash
+curl -s http://localhost:3000/v1/models | jq '.data[].id'
+```
+
+Pick any of those IDs inside Claude Code:
+
+```
+/model claude-opus-4.8
+```
+
+If your Claude Code build lists provider models in the `/model` picker, it will
+show exactly this list. Older builds show Anthropic's built-in presets instead —
+typing the ID after `/model`, or setting `ANTHROPIC_MODEL`, works either way.
+
+GitHub Copilot does **not** serve Anthropic's public model names, so Claude
+Code's identifiers (dated ones such as `claude-sonnet-4-5-20250929` and the
+`sonnet` / `opus` / `haiku` / `opusplan` aliases) are mapped onto whatever
+Copilot currently serves:
 
 | Claude Code model | Copilot model |
 |---|---|
@@ -355,19 +375,14 @@ aliases) are therefore mapped onto whatever Copilot currently serves:
 | `claude-haiku-4-5*`, `claude-3-5-haiku*`, `haiku` | `claude-haiku-4.5` |
 | `claude-3-7-sonnet*`, `claude-3-5-sonnet*` | `claude-sonnet-5` |
 
-A live Copilot model ID (`claude-opus-5`, `claude-opus-4.8`, `claude-opus-4.8-fast`,
-`claude-opus-4.7`, `claude-sonnet-5`, `claude-haiku-4.5`) is forwarded verbatim.
-Unrecognised `claude-*` identifiers fall back to `DEFAULT_CLAUDE_MODEL`
-(`claude-sonnet-5`), so a model rename will not break your session.
+These are only defaults. Any ID present in your live catalog is forwarded
+verbatim, and if a mapped target is *not* in your catalog the request is
+retargeted to the newest live model of the same family (Opus → newest Opus,
+Sonnet → newest Sonnet, ...). Unrecognised `claude-*` identifiers fall back to
+`DEFAULT_CLAUDE_MODEL`, so a model rename will not break your session.
 
-To see exactly what your own account can serve:
-
-```bash
-curl -s http://localhost:3000/v1/models | jq '.data[].id'
-```
-
-If a request fails with `model_not_supported`, Copilot has retired that ID —
-update `CLAUDE_MODEL_MAPPINGS` in `src/config/index.ts` to a live one.
+Set `EXPOSE_ALL_COPILOT_MODELS=true` to also advertise the non-Claude models
+(GPT, Gemini) your plan includes.
 
 ### Getting the most from a Copilot Pro+ plan
 
@@ -470,7 +485,8 @@ All settings are optional; see [`.env.example`](.env.example) for the full list.
 | `COPILOT_INTEGRATION_ID` | `vscode-chat` | Client identity required by Copilot |
 | `COPILOT_EDITOR_VERSION` / `COPILOT_PLUGIN_VERSION` / `COPILOT_USER_AGENT` | vscode defaults | Client identity headers |
 | `DEFAULT_CLAUDE_MODEL` | `claude-sonnet-5` | Fallback for unknown Claude models |
-| `MAX_OUTPUT_TOKENS` | `64000` | Ceiling applied to `max_tokens` |
+| `EXPOSE_ALL_COPILOT_MODELS` | `false` | Also advertise non-Claude models (GPT, Gemini) on `/v1/models` |
+| `MAX_OUTPUT_TOKENS` | `64000` | Ceiling applied to `max_tokens` (the model's own limit wins when lower) |
 | `ENABLE_UPSTREAM_STREAMING` | `true` | Set to `false` to buffer upstream responses |
 | `RATE_LIMIT_DEFAULT` / `RATE_LIMIT_CHAT_COMPLETIONS` | `600` / `300` | Requests per minute (`0` disables) |
 | `MAX_TOKENS_PER_REQUEST` / `MAX_TOKENS_PER_MINUTE` | `0` | Optional token ceilings (`0` disables) |

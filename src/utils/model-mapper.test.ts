@@ -1,3 +1,4 @@
+import { CatalogModel, setCatalogForTesting } from '../services/model-catalog.js';
 import {
   getAvailableModels,
   getModelById,
@@ -5,6 +6,25 @@ import {
   isValidClaudeModel,
   mapClaudeModelToCopilot,
 } from './model-mapper.js';
+
+const catalogModel = (
+  id: string,
+  overrides: Partial<CatalogModel> = {}
+): CatalogModel => ({
+  id,
+  displayName: id,
+  vendor: 'Anthropic',
+  isClaude: true,
+  pickerEnabled: true,
+  isChatDefault: false,
+  supportsTools: true,
+  supportsVision: false,
+  ...overrides,
+});
+
+afterEach(() => {
+  setCatalogForTesting([]);
+});
 
 describe('Model Mapper', () => {
   describe('mapClaudeModelToCopilot', () => {
@@ -42,6 +62,34 @@ describe('Model Mapper', () => {
       expect(mapClaudeModelToCopilot('gpt-5.5')).toBe('gpt-5.5');
       expect(mapClaudeModelToCopilot('gemini-3.8-flash')).toBe('gemini-3.8-flash');
     });
+
+    it('forwards any model the live catalog offers', () => {
+      setCatalogForTesting([
+        catalogModel('claude-opus-4.9'),
+        catalogModel('claude-sonnet-6'),
+        catalogModel('gpt-6', { vendor: 'OpenAI', isClaude: false }),
+      ]);
+
+      expect(mapClaudeModelToCopilot('claude-opus-4.9')).toBe('claude-opus-4.9');
+      expect(mapClaudeModelToCopilot('CLAUDE-SONNET-6')).toBe('claude-sonnet-6');
+      expect(mapClaudeModelToCopilot('gpt-6')).toBe('gpt-6');
+    });
+
+    it('retargets aliases when the mapped model is not offered', () => {
+      setCatalogForTesting([
+        catalogModel('claude-opus-4.9'),
+        catalogModel('claude-opus-4.9-fast'),
+        catalogModel('claude-sonnet-6'),
+        catalogModel('claude-haiku-5'),
+      ]);
+
+      // Static mappings point at claude-opus-5 / claude-sonnet-5, which this
+      // account does not have.
+      expect(mapClaudeModelToCopilot('opus')).toBe('claude-opus-4.9');
+      expect(mapClaudeModelToCopilot('claude-sonnet-4-5-20250929')).toBe('claude-sonnet-6');
+      expect(mapClaudeModelToCopilot('haiku')).toBe('claude-haiku-5');
+      expect(mapClaudeModelToCopilot('claude-opus-9-20991231')).toBe('claude-opus-4.9');
+    });
   });
 
   describe('isValidClaudeModel', () => {
@@ -77,6 +125,24 @@ describe('Model Mapper', () => {
         'claude-sonnet-5',
         'claude-haiku-4.5',
       ]));
+    });
+
+    it('advertises every Claude model the account can use', () => {
+      setCatalogForTesting([
+        catalogModel('claude-opus-4.9', { displayName: 'Claude Opus 4.9' }),
+        catalogModel('claude-sonnet-6', { displayName: 'Claude Sonnet 6' }),
+        catalogModel('claude-haiku-5', { displayName: 'Claude Haiku 5' }),
+        catalogModel('claude-retired-1', { pickerEnabled: false }),
+        catalogModel('gpt-6', { vendor: 'OpenAI', isClaude: false }),
+      ]);
+
+      const models = getAvailableModels().data;
+      expect(models.map((model) => model.id)).toEqual([
+        'claude-opus-4.9',
+        'claude-sonnet-6',
+        'claude-haiku-5',
+      ]);
+      expect(models[0].display_name).toBe('Claude Opus 4.9');
     });
   });
 

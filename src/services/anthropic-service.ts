@@ -38,7 +38,8 @@ import {
   CopilotToolChoice,
 } from '../types/copilot-chat.js';
 import { mapClaudeModelToCopilot } from '../utils/model-mapper.js';
-import { getMachineId } from '../utils/machine-id.js';
+import { getCatalogOutputLimit } from './model-catalog.js';
+import { buildCopilotHeaders } from '../utils/copilot-headers.js';
 import { logger } from '../utils/logger.js';
 
 /** Average characters per token, used for local estimates only. */
@@ -412,7 +413,15 @@ export function buildCopilotChatRequest(
 
   const maxTokens = request.max_tokens;
   if (typeof maxTokens === 'number' && maxTokens > 0) {
-    body.max_tokens = Math.min(maxTokens, config.anthropic.maxOutputTokens);
+    // Copilot rejects a max_tokens above the model's published ceiling, and
+    // Claude Code asks for Anthropic-sized budgets, so clamp to whichever
+    // limit is lower.
+    const modelLimit = getCatalogOutputLimit(copilotModel);
+    const ceiling = Math.min(
+      config.anthropic.maxOutputTokens,
+      modelLimit ?? Number.POSITIVE_INFINITY
+    );
+    body.max_tokens = Math.min(maxTokens, ceiling);
   }
 
   if (typeof request.temperature === 'number') {
@@ -442,30 +451,7 @@ export function buildCopilotChatRequest(
 /**
  * Build the headers required by GitHub Copilot's chat endpoint.
  */
-export function buildCopilotHeaders(
-  copilotToken: string,
-  options: { stream: boolean; hasImages: boolean }
-): Record<string, string> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    Accept: options.stream ? 'text/event-stream' : 'application/json',
-    Authorization: 'Bearer ' + copilotToken,
-    'X-Request-Id': uuidv4(),
-    'X-Github-Api-Version': '2025-05-01',
-    'Machine-Id': getMachineId(),
-    'Copilot-Integration-Id': config.copilot.integrationId,
-    'Editor-Version': config.copilot.editorVersion,
-    'Editor-Plugin-Version': config.copilot.pluginVersion,
-    'User-Agent': config.copilot.userAgent,
-    'Openai-Intent': 'conversation-panel',
-  };
-
-  if (options.hasImages) {
-    headers['Copilot-Vision-Request'] = 'true';
-  }
-
-  return headers;
-}
+export { buildCopilotHeaders };
 
 // ============================================================================
 // Response translation: Copilot -> Anthropic

@@ -3,6 +3,16 @@
 ## [Unreleased]
 
 ### Added
+- **Live model discovery.** `GET /v1/models` now reflects the signed-in account's real
+  Copilot catalog (`GET {endpoints.api}/models`, cached for 10 minutes), so every Claude
+  model the plan includes is selectable from Claude Code instead of a hardcoded subset.
+  The static list in `src/config/index.ts` remains as an offline/cold-start fallback.
+- **Catalog-aware model resolution.** Any live model ID is forwarded verbatim, and an
+  alias whose mapped target is not in the account's catalog is retargeted to the newest
+  live model of the same family instead of failing with `model_not_supported`.
+- **Per-model output limits.** `max_tokens` is clamped to the model's published
+  `max_output_tokens` when it is lower than `MAX_OUTPUT_TOKENS`.
+- `EXPOSE_ALL_COPILOT_MODELS` to also advertise non-Claude models (GPT, Gemini).
 - **Tool calling** for Claude Code: Anthropic `tools` / `tool_choice` are translated to
   Copilot function tools, `tool_use` blocks to `tool_calls`, and `tool_result` blocks
   to standalone `tool` messages in the order the upstream API expects.

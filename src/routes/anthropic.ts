@@ -21,6 +21,7 @@ import {
   streamAnthropicMessage,
 } from '../services/anthropic-service.js';
 import { getAvailableModels, getModelById } from '../utils/model-mapper.js';
+import { refreshModelCatalog } from '../services/model-catalog.js';
 import {
   AnthropicCountTokensRequest,
   AnthropicError,
@@ -128,13 +129,15 @@ function toAnthropicErrorResponse(error: unknown): { status: number; body: Anthr
   };
 }
 
-// GET /v1/models - list the models exposed through Copilot
-anthropicRoutes.get('/models', requireAuth, (_req, res) => {
+// GET /v1/models - list every Copilot model the account can use
+anthropicRoutes.get('/models', requireAuth, async (_req, res) => {
+  await refreshModelCatalog();
   res.json(getAvailableModels());
 });
 
 // GET /v1/models/:model - describe a single model
-anthropicRoutes.get('/models/:model', requireAuth, (req, res) => {
+anthropicRoutes.get('/models/:model', requireAuth, async (req, res) => {
+  await refreshModelCatalog();
   const model = getModelById(req.params.model);
 
   if (!model) {

@@ -2,6 +2,7 @@ import { app } from './server.js';
 import { config } from './config/index.js';
 import { logger } from './utils/logger.js';
 import { loadPersistedTokens } from './services/auth-service.js';
+import { primeModelCatalog } from './services/model-catalog.js';
 
 const startServer = () => {
   const port = config.server.port;
@@ -10,7 +11,8 @@ const startServer = () => {
   try {
     // Load persisted tokens on startup
     loadPersistedTokens();
-    
+    // Warm the model list so the first /v1/models call is already accurate
+    primeModelCatalog();
     app.listen(port, () => {
       logger.info(`Server running at http://${host}:${port}/`);
       logger.info('Press CTRL-C to stop the server');

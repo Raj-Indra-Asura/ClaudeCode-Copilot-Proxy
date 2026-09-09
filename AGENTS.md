@@ -33,6 +33,7 @@ This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get sta
 | `routes/anthropic.ts` | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models` | ✅ Implemented |
 | `services/anthropic-service.ts` | Translate Anthropic ↔ Copilot, incl. tools, images, SSE | ✅ Implemented |
 | `utils/model-mapper.ts` | Claude model name → Copilot model name | ✅ Implemented |
+| `services/model-catalog.ts` | Live `GET {endpoints.api}/models` catalog, cached 10 min | ✅ Implemented |
 | `types/anthropic.ts` | Anthropic Messages API types | ✅ Implemented |
 | `types/copilot-chat.ts` | Copilot chat-completions (OpenAI dialect) types | ✅ Implemented |
 | `services/auth-service.ts` | GitHub OAuth device flow, token refresh | ✅ Implemented |
@@ -73,9 +74,10 @@ rejected with `invalid apiVersion`, so it cannot be changed casually.
 account-specific (`api.individual.githubcopilot.com` for individual plans).
 
 **Model IDs**: Copilot serves its own Anthropic model IDs and retires them quickly;
-it does *not* accept Anthropic's public names. Verify with `GET {endpoints.api}/models`
-before changing `CLAUDE_MODEL_MAPPINGS` — a wrong string fails with
-`400 model_not_supported`.
+it does *not* accept Anthropic's public names. `services/model-catalog.ts` fetches the
+account's live list from `GET {endpoints.api}/models`, which drives `/v1/models`,
+alias retargeting and per-model `max_tokens` clamping. `CLAUDE_MODEL_MAPPINGS` is only
+the cold-start fallback used before the catalog loads.
 
 **Response shape**: a tool-calling reply is split across multiple `choices` entries
 (text in one, `tool_calls` in another). Never read only `choices[0]`.

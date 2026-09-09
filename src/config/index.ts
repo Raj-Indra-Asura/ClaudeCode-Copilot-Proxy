@@ -24,6 +24,8 @@ const envSchema = z.object({
   COPILOT_USER_AGENT: z.string().default('GitHubCopilotChat/0.26.7'),
   // Default model used when Claude Code does not send a known model
   DEFAULT_CLAUDE_MODEL: z.string().default('claude-sonnet-5'),
+  // Set to 'true' to also advertise non-Claude Copilot models on /v1/models
+  EXPOSE_ALL_COPILOT_MODELS: z.enum(['true', 'false']).default('false'),
   // Upper bound applied to max_tokens sent upstream
   MAX_OUTPUT_TOKENS: z.string().default('64000'),
   // Set to 'false' to fall back to buffered (non-streaming) upstream requests
@@ -45,6 +47,7 @@ const env = envSchema.parse({
   COPILOT_PLUGIN_VERSION: process.env.COPILOT_PLUGIN_VERSION,
   COPILOT_USER_AGENT: process.env.COPILOT_USER_AGENT,
   DEFAULT_CLAUDE_MODEL: process.env.DEFAULT_CLAUDE_MODEL,
+  EXPOSE_ALL_COPILOT_MODELS: process.env.EXPOSE_ALL_COPILOT_MODELS,
   MAX_OUTPUT_TOKENS: process.env.MAX_OUTPUT_TOKENS,
   ENABLE_UPSTREAM_STREAMING: process.env.ENABLE_UPSTREAM_STREAMING,
 });
@@ -105,8 +108,10 @@ export const CLAUDE_MODEL_MAPPINGS: Record<string, string> = {
   'haiku': 'claude-haiku-4.5',
 };
 
-// Models advertised on GET /v1/models. `DEFAULT_CLAUDE_MODEL` decides which
-// Copilot model unrecognised Claude identifiers fall back to.
+// Models advertised on GET /v1/models when the live catalog is unavailable.
+// The live catalog from GET {endpoints.api}/models always takes precedence, so
+// this list is only a cold-start/offline fallback. `DEFAULT_CLAUDE_MODEL`
+// decides which Copilot model unrecognised Claude identifiers fall back to.
 export const AVAILABLE_CLAUDE_MODELS = [
   {
     id: 'claude-opus-5',
@@ -182,6 +187,7 @@ export const config = {
   },
   anthropic: {
     defaultModel: env.DEFAULT_CLAUDE_MODEL,
+    exposeAllModels: env.EXPOSE_ALL_COPILOT_MODELS === 'true',
     maxOutputTokens: parseInt(env.MAX_OUTPUT_TOKENS, 10),
     streamUpstream: env.ENABLE_UPSTREAM_STREAMING === 'true',
   },
