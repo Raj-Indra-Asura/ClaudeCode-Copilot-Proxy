@@ -30,24 +30,40 @@ This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get sta
 
 | Component | Purpose | Status |
 |-----------|---------|--------|
-| `/v1/messages` | Anthropic Messages API endpoint | 🔴 TODO |
-| `/v1/models` | List available Claude models | 🔴 TODO |
-| `anthropic-service.ts` | Translate Anthropic ↔ Copilot formats | 🔴 TODO |
-| `auth-service.ts` | GitHub OAuth device flow (existing) | ✅ Existing |
-| `copilot-service.ts` | Copilot API integration (existing) | ✅ Existing |
+| `routes/anthropic.ts` | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models` | ✅ Implemented |
+| `services/anthropic-service.ts` | Translate Anthropic ↔ Copilot, incl. tools, images, SSE | ✅ Implemented |
+| `utils/model-mapper.ts` | Claude model name → Copilot model name | ✅ Implemented |
+| `types/anthropic.ts` | Anthropic Messages API types | ✅ Implemented |
+| `types/copilot-chat.ts` | Copilot chat-completions (OpenAI dialect) types | ✅ Implemented |
+| `services/auth-service.ts` | GitHub OAuth device flow, token refresh | ✅ Implemented |
+| `routes/openai.ts` / `services/copilot-service.ts` | OpenAI-compatible surface for Cursor | ✅ Implemented |
 
 ### API Mappings
 
 **Anthropic Messages API → GitHub Copilot:**
 
-| Anthropic Field | Copilot Equivalent |
-|-----------------|-------------------|
-| `model` (e.g., `claude-opus-4-5-20250514`) | Map to Copilot's `claude-opus-4.5` |
-| `messages` array | Convert to Copilot prompt format |
-| `max_tokens` | `max_tokens` |
-| `temperature` | `temperature` |
-| `stream` | `stream` |
-| `system` | Prepend to prompt |
+GitHub Copilot exposes the Claude models behind an **OpenAI-style chat completions**
+endpoint, so the translation is Anthropic Messages API ⇄ OpenAI chat completions.
+
+| Anthropic field | Copilot equivalent |
+|-----------------|--------------------|
+| `model` (e.g. `claude-sonnet-4-5-20250929`) | Mapped to `claude-sonnet-4.5` (longest-prefix match) |
+| `messages` | `messages` array, roles preserved |
+| `system` (string or text blocks) | Leading `system` message |
+| `content` text blocks | `content` string, or multimodal parts when images are present |
+| `content` image blocks | `image_url` parts with a `data:` URI |
+| `tools` | `tools` (function definitions); names sanitised to `[A-Za-z0-9_-]` |
+| `tool_choice` `auto`/`any`/`none`/`tool` | `auto`/`required`/`none`/`{type:'function'}` |
+| assistant `tool_use` blocks | assistant `tool_calls` |
+| user `tool_result` blocks | standalone `role: 'tool'` messages placed before the user text |
+| `max_tokens`, `temperature`, `top_p` | Same names |
+| `stop_sequences` | `stop` |
+| `stream` | `stream`, with SSE translated back into Anthropic events |
+| `cache_control`, `thinking` | Accepted and ignored (no Copilot equivalent) |
+
+**Required upstream headers** (see `buildCopilotHeaders`): `Copilot-Integration-Id`,
+`Editor-Version`, `Editor-Plugin-Version`, `Machine-Id`, and `Copilot-Vision-Request`
+when the request contains images. Omitting `Copilot-Integration-Id` causes rejections.
 
 ### Configuration for Claude Code
 
@@ -81,9 +97,15 @@ npm start             # Production mode
 ### Testing
 
 ```bash
-npm test              # Run tests
+npm test              # Run Jest tests
+npm run typecheck     # tsc --noEmit
 npm run lint          # Lint code
 ```
+
+Tests live next to the code they cover (`*.test.ts`) and are excluded from the build.
+The translation layer is designed to be testable without network access: prefer adding
+cases to `src/services/anthropic-service.test.ts` (pure converters and the
+`convertCopilotStreamToAnthropicEvents` generator) over mocking `fetch`.
 
 ## Landing the Plane (Session Completion)
 

@@ -1,333 +1,267 @@
 /**
- * Anthropic API Routes - Claude Code compatible endpoints
- * 
- * Implements Anthropic Messages API format for Claude Code integration
+ * Anthropic API routes - the endpoints Claude Code talks to.
+ *
+ * Implements the subset of the Anthropic Messages API that Claude Code uses:
+ * `POST /v1/messages` (streaming and buffered), `POST /v1/messages/count_tokens`,
+ * `GET /v1/models` and `GET /v1/models/:model`.
  */
 
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import { 
-  isTokenValid, 
+import {
+  ensureCopilotToken,
   getCopilotToken,
-  refreshCopilotToken 
+  isTokenValid,
 } from '../services/auth-service.js';
-import { 
-  makeAnthropicCompletionRequest,
+import {
+  CopilotApiError,
   createAnthropicError,
-  generateMessageId,
+  estimateInputTokens,
+  makeAnthropicCompletionRequest,
+  streamAnthropicMessage,
 } from '../services/anthropic-service.js';
-import { getAvailableModels, mapClaudeModelToCopilot } from '../utils/model-mapper.js';
-import { 
+import { getAvailableModels, getModelById } from '../utils/model-mapper.js';
+import {
+  AnthropicCountTokensRequest,
+  AnthropicError,
   AnthropicMessageRequest,
-  MessageStartEvent,
-  ContentBlockStartEvent,
-  ContentBlockDeltaEvent,
-  ContentBlockStopEvent,
-  MessageDeltaEvent,
-  MessageStopEvent,
+  AnthropicStreamEvent,
 } from '../types/anthropic.js';
 import { logger } from '../utils/logger.js';
 import { trackRequest } from '../services/usage-service.js';
 
 export const anthropicRoutes = express.Router();
 
-// Authentication middleware for Anthropic endpoints
+/**
+ * Ensure a usable GitHub Copilot token is available, refreshing it when the
+ * cached one has expired.
+ */
 const requireAuth = async (
-  _req: express.Request, 
-  res: express.Response, 
+  _req: express.Request,
+  res: express.Response,
   next: express.NextFunction
 ) => {
-  
-  // We accept requests with or without API key, but require GitHub Copilot auth
-  if (!isTokenValid()) {
-    const error = createAnthropicError(
-      'authentication_error',
-      'GitHub Copilot authentication required. Please authenticate at /auth.html'
-    );
-    return res.status(401).json(error);
+  if (isTokenValid()) {
+    return next();
   }
 
   try {
-    // Check if token needs refreshing
-    if (getCopilotToken() && !isTokenValid()) {
-      await refreshCopilotToken();
-    }
-    next();
+    await ensureCopilotToken();
+    return next();
   } catch (error) {
-    logger.error('Token refresh failed in Anthropic middleware:', error);
-    const authError = createAnthropicError(
-      'authentication_error',
-      'GitHub Copilot authentication failed. Please re-authenticate.'
+    logger.warn(
+      `Copilot authentication unavailable: ${
+        error instanceof Error ? error.message : String(error)
+      }`
     );
-    return res.status(401).json(authError);
+    return res
+      .status(401)
+      .json(
+        createAnthropicError(
+          'authentication_error',
+          'GitHub Copilot authentication required. Please authenticate at /auth.html'
+        )
+      );
   }
 };
 
-// GET /v1/models - List available Claude models
-anthropicRoutes.get('/models', requireAuth, (_req, res) => {
-  const models = getAvailableModels();
-  res.json(models);
-});
-
-// POST /v1/messages/count_tokens - Token counting (stub)
-anthropicRoutes.post('/messages/count_tokens', requireAuth, async (req, res) => {
-  // Return approximate token count based on message content
-  const { messages, system } = req.body;
-  let totalChars = 0;
-  
-  if (system) {
-    totalChars += typeof system === 'string' ? system.length : JSON.stringify(system).length;
+/**
+ * Validate an incoming Messages API request.
+ *
+ * @returns An Anthropic error body when the request is invalid, otherwise null
+ */
+function validateMessageRequest(request: AnthropicMessageRequest): AnthropicError | null {
+  if (!request || typeof request !== 'object') {
+    return createAnthropicError('invalid_request_error', 'Request body must be a JSON object');
   }
-  
-  if (messages && Array.isArray(messages)) {
-    for (const msg of messages) {
-      if (typeof msg.content === 'string') {
-        totalChars += msg.content.length;
-      } else if (Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (block.type === 'text' && block.text) {
-            totalChars += block.text.length;
-          }
-        }
-      }
+
+  if (!request.model || typeof request.model !== 'string') {
+    return createAnthropicError('invalid_request_error', 'model: field required');
+  }
+
+  if (!Array.isArray(request.messages) || request.messages.length === 0) {
+    return createAnthropicError('invalid_request_error', 'messages: field required');
+  }
+
+  if (typeof request.max_tokens !== 'number' || request.max_tokens <= 0) {
+    return createAnthropicError(
+      'invalid_request_error',
+      'max_tokens: field required and must be a positive number'
+    );
+  }
+
+  for (const message of request.messages) {
+    if (!message || !['user', 'assistant'].includes(message.role)) {
+      return createAnthropicError(
+        'invalid_request_error',
+        'messages: each message must have a valid role (user or assistant)'
+      );
+    }
+    if (message.content === undefined || message.content === null) {
+      return createAnthropicError(
+        'invalid_request_error',
+        'messages: each message must have content'
+      );
     }
   }
-  
-  // Rough approximation: 1 token ≈ 4 characters
-  const inputTokens = Math.ceil(totalChars / 4);
-  
-  res.json({ input_tokens: inputTokens });
-});
 
-// POST /v1/messages - Create a message (main chat endpoint)
-anthropicRoutes.post('/messages', requireAuth, async (req, res, _next) => {
-  const sessionId = res.locals.sessionId || uuidv4();
-  
-  try {
-    const request = req.body as AnthropicMessageRequest;
-    const { messages, model, max_tokens, stream = false } = request;
-    
-    // Validate required fields
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      const error = createAnthropicError(
-        'invalid_request_error',
-        'messages: field required'
-      );
-      return res.status(400).json(error);
-    }
-    
-    if (!model) {
-      const error = createAnthropicError(
-        'invalid_request_error',
-        'model: field required'
-      );
-      return res.status(400).json(error);
-    }
-    
-    if (!max_tokens || typeof max_tokens !== 'number') {
-      const error = createAnthropicError(
-        'invalid_request_error',
-        'max_tokens: field required and must be a number'
-      );
-      return res.status(400).json(error);
-    }
-    
-    // Validate message format
-    for (const msg of messages) {
-      if (!msg.role || !['user', 'assistant'].includes(msg.role)) {
-        const error = createAnthropicError(
-          'invalid_request_error',
-          'messages: each message must have a valid role (user or assistant)'
-        );
-        return res.status(400).json(error);
-      }
-      if (msg.content === undefined || msg.content === null) {
-        const error = createAnthropicError(
-          'invalid_request_error',
-          'messages: each message must have content'
-        );
-        return res.status(400).json(error);
-      }
-    }
-    
-    const copilotToken = getCopilotToken();
-    if (!copilotToken) {
-      const error = createAnthropicError(
-        'authentication_error',
-        'GitHub Copilot token not available'
-      );
-      return res.status(401).json(error);
-    }
-    
-    // Track request
-    trackRequest(sessionId, 0);
-    
-    // Handle streaming vs non-streaming
-    if (stream) {
-      await handleAnthropicStreaming(req, res, request, copilotToken.token, sessionId);
-    } else {
-      // Non-streaming response
-      try {
-        const response = await makeAnthropicCompletionRequest(request, copilotToken.token);
-        
-        // Track token usage
-        if (response.usage) {
-          trackRequest(sessionId, response.usage.input_tokens + response.usage.output_tokens);
-        }
-        
-        res.json(response);
-      } catch (error) {
-        logger.error('Error in Anthropic completion:', error);
-        const apiError = createAnthropicError(
-          'api_error',
-          error instanceof Error ? error.message : 'Internal server error'
-        );
-        return res.status(500).json(apiError);
-      }
-    }
-  } catch (error) {
-    logger.error('Error processing Anthropic request:', error);
-    const apiError = createAnthropicError(
+  return null;
+}
+
+/**
+ * Translate a thrown error into an Anthropic error body plus HTTP status.
+ */
+function toAnthropicErrorResponse(error: unknown): { status: number; body: AnthropicError } {
+  if (error instanceof CopilotApiError) {
+    return {
+      status: error.status,
+      body: createAnthropicError(error.errorType, error.message),
+    };
+  }
+
+  return {
+    status: 500,
+    body: createAnthropicError(
       'api_error',
       error instanceof Error ? error.message : 'Internal server error'
-    );
-    return res.status(500).json(apiError);
+    ),
+  };
+}
+
+// GET /v1/models - list the models exposed through Copilot
+anthropicRoutes.get('/models', requireAuth, (_req, res) => {
+  res.json(getAvailableModels());
+});
+
+// GET /v1/models/:model - describe a single model
+anthropicRoutes.get('/models/:model', requireAuth, (req, res) => {
+  const model = getModelById(req.params.model);
+
+  if (!model) {
+    return res
+      .status(404)
+      .json(createAnthropicError('not_found_error', `model: ${req.params.model} not found`));
+  }
+
+  return res.json(model);
+});
+
+// POST /v1/messages/count_tokens - local token estimate
+anthropicRoutes.post('/messages/count_tokens', requireAuth, (req, res) => {
+  const { messages, system, tools } = (req.body ?? {}) as AnthropicCountTokensRequest;
+
+  res.json({ input_tokens: estimateInputTokens(messages ?? [], system, tools) });
+});
+
+// POST /v1/messages - the main Claude Code endpoint
+anthropicRoutes.post('/messages', requireAuth, async (req, res) => {
+  const sessionId: string = res.locals.sessionId || uuidv4();
+  const request = req.body as AnthropicMessageRequest;
+
+  const validationError = validateMessageRequest(request);
+  if (validationError) {
+    return res.status(400).json(validationError);
+  }
+
+  const copilotToken = getCopilotToken();
+  if (!copilotToken) {
+    return res
+      .status(401)
+      .json(createAnthropicError('authentication_error', 'GitHub Copilot token not available'));
+  }
+
+  trackRequest(sessionId, 0);
+
+  if (request.stream) {
+    return handleStreamingMessage(res, request, copilotToken.token, sessionId);
+  }
+
+  try {
+    const response = await makeAnthropicCompletionRequest(request, copilotToken.token);
+    trackRequest(sessionId, response.usage.input_tokens + response.usage.output_tokens);
+    return res.json(response);
+  } catch (error) {
+    logger.error('Anthropic completion failed:', error);
+    const { status, body } = toAnthropicErrorResponse(error);
+    return res.status(status).json(body);
   }
 });
 
 /**
- * Handle streaming response in Anthropic SSE format
+ * Write a single Anthropic SSE event.
  */
-async function handleAnthropicStreaming(
-  req: express.Request,
+function writeEvent(res: express.Response, event: AnthropicStreamEvent): void {
+  res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+}
+
+/**
+ * Stream a response to Claude Code in Anthropic SSE format.
+ */
+async function handleStreamingMessage(
   res: express.Response,
   request: AnthropicMessageRequest,
   copilotToken: string,
   sessionId: string
 ): Promise<void> {
-  const { model } = request;
-  const messageId = generateMessageId();
-  // Model mapping is handled in makeAnthropicCompletionRequest
-  void mapClaudeModelToCopilot(model); // Validate model
-  
-  // Set SSE headers
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
-  
-  let outputTokens = 0;
-  
+  let clientGone = false;
+  // Listen on the response, not the request: `req` emits 'close' as soon as
+  // its body has been consumed, which would abort every stream immediately.
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientGone = true;
+    }
+  });
+
   try {
-    // Send message_start event
-    const messageStart: MessageStartEvent = {
-      type: 'message_start',
-      message: {
-        id: messageId,
-        type: 'message',
-        role: 'assistant',
-        content: [],
-        model: model,
-        stop_reason: null,
-        stop_sequence: null,
-        usage: {
-          input_tokens: 0,
-          output_tokens: 0,
-        },
-      },
-    };
-    res.write(`event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`);
-    
-    // Send content_block_start event
-    const contentBlockStart: ContentBlockStartEvent = {
-      type: 'content_block_start',
-      index: 0,
-      content_block: {
-        type: 'text',
-        text: '',
-      },
-    };
-    res.write(`event: content_block_start\ndata: ${JSON.stringify(contentBlockStart)}\n\n`);
-    
-    // Make the actual request to Copilot
-    // For now, we'll make a non-streaming request and simulate streaming
-    // A full implementation would use Copilot's streaming endpoint
-    const response = await makeAnthropicCompletionRequest(
-      { ...request, stream: false },
-      copilotToken
-    );
-    
-    // Extract text from response
-    const text = response.content
-      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
-      .map((block) => block.text)
-      .join('');
-    
-    // Simulate streaming by sending text in chunks
-    const chunkSize = 20; // Characters per chunk
-    for (let i = 0; i < text.length; i += chunkSize) {
-      const chunk = text.slice(i, i + chunkSize);
-      
-      const contentDelta: ContentBlockDeltaEvent = {
-        type: 'content_block_delta',
-        index: 0,
-        delta: {
-          type: 'text_delta',
-          text: chunk,
-        },
-      };
-      res.write(`event: content_block_delta\ndata: ${JSON.stringify(contentDelta)}\n\n`);
-      
-      outputTokens += Math.ceil(chunk.length / 4); // Rough token estimate
-      
-      // Small delay to simulate streaming (optional, can be removed for speed)
-      await new Promise((resolve) => setTimeout(resolve, 10));
+    let inputTokens = 0;
+    let outputTokens = 0;
+
+    for await (const event of streamAnthropicMessage(request, copilotToken)) {
+      if (clientGone) {
+        logger.debug('Client disconnected, aborting stream');
+        break;
+      }
+
+      if (!res.headersSent) {
+        // Headers are only committed once the upstream call succeeds, so that
+        // early failures can still be reported with a real status code.
+        res.status(200);
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders();
+      }
+
+      if (event.type === 'message_start') {
+        inputTokens = event.message.usage.input_tokens;
+      } else if (event.type === 'message_delta') {
+        inputTokens = event.usage.input_tokens ?? inputTokens;
+        outputTokens = event.usage.output_tokens;
+      }
+
+      writeEvent(res, event);
     }
-    
-    // Send content_block_stop event
-    const contentBlockStop: ContentBlockStopEvent = {
-      type: 'content_block_stop',
-      index: 0,
-    };
-    res.write(`event: content_block_stop\ndata: ${JSON.stringify(contentBlockStop)}\n\n`);
-    
-    // Send message_delta event with stop_reason
-    const messageDelta: MessageDeltaEvent = {
-      type: 'message_delta',
-      delta: {
-        stop_reason: response.stop_reason || 'end_turn',
-        stop_sequence: response.stop_sequence,
-      },
-      usage: {
-        output_tokens: response.usage?.output_tokens || outputTokens,
-      },
-    };
-    res.write(`event: message_delta\ndata: ${JSON.stringify(messageDelta)}\n\n`);
-    
-    // Send message_stop event
-    const messageStop: MessageStopEvent = {
-      type: 'message_stop',
-    };
-    res.write(`event: message_stop\ndata: ${JSON.stringify(messageStop)}\n\n`);
-    
-    // Track usage
-    if (response.usage) {
-      trackRequest(sessionId, response.usage.input_tokens + response.usage.output_tokens);
+
+    trackRequest(sessionId, inputTokens + outputTokens);
+
+    if (!clientGone) {
+      res.end();
     }
-    
-    res.end();
   } catch (error) {
-    logger.error('Error in Anthropic streaming:', error);
-    
-    // Send error event
-    const errorEvent = {
-      type: 'error',
-      error: {
-        type: 'api_error',
-        message: error instanceof Error ? error.message : 'Streaming error',
-      },
-    };
-    res.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`);
+    logger.error('Anthropic streaming failed:', error);
+    const { status, body } = toAnthropicErrorResponse(error);
+
+    if (clientGone) {
+      return;
+    }
+
+    if (!res.headersSent) {
+      res.status(status).json(body);
+      return;
+    }
+
+    writeEvent(res, { type: 'error', error: body.error });
     res.end();
   }
 }

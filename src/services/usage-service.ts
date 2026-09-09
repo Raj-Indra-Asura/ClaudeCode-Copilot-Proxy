@@ -13,6 +13,8 @@ interface UsageMetrics {
     tokens: number;
     timestamp: number;
   }>;
+  // Timestamps of recent requests, used for the sliding-window rate limit
+  requestTimestamps: number[];
 }
 
 interface ApiKeyUsage {
@@ -32,7 +34,8 @@ export function initializeUsage(sessionId: string): void {
       tokenCount: 0,
       lastRequestTime: Date.now(),
       startTime: Date.now(),
-      tokenTimestamps: []
+      tokenTimestamps: [],
+      requestTimestamps: []
     };
     logger.debug(`Initialized usage tracking for session: ${sessionId.substring(0, 8)}...`);
   }
@@ -52,6 +55,7 @@ export function trackRequest(sessionId: string, tokenCount = 0): void {
   usage[sessionId].requestCount += 1;
   usage[sessionId].tokenCount += tokenCount;
   usage[sessionId].lastRequestTime = now;
+  usage[sessionId].requestTimestamps.push(now);
   
   // Record token usage with timestamp for rate limiting over time
   if (tokenCount > 0) {
@@ -65,6 +69,12 @@ export function trackRequest(sessionId: string, tokenCount = 0): void {
   const fiveMinutesAgo = now - 5 * 60 * 1000;
   usage[sessionId].tokenTimestamps = usage[sessionId].tokenTimestamps.filter(
     entry => entry.timestamp >= fiveMinutesAgo
+  );
+
+  // Keep only the request timestamps inside the rate-limit window
+  const oneMinuteAgo = now - 60 * 1000;
+  usage[sessionId].requestTimestamps = usage[sessionId].requestTimestamps.filter(
+    timestamp => timestamp >= oneMinuteAgo
   );
   
   logger.debug(`Tracked request for session ${sessionId.substring(0, 8)}...: +${tokenCount} tokens`);
@@ -108,33 +118,40 @@ export function getTokenUsageInWindow(sessionId: string, windowMs: number): numb
 }
 
 /**
- * Check if a session has exceeded rate limits
+ * Check if a session has exceeded its request rate limit.
+ *
+ * Uses a sliding one-minute window over the recorded request timestamps. The
+ * previous implementation compared the *cumulative* request count against the
+ * limit, which permanently rate-limited any long-running Claude Code session.
+ *
  * @param sessionId Unique identifier for the session
- * @param maxRequestsPerMinute Maximum requests allowed per minute
+ * @param maxRequestsPerMinute Maximum requests allowed per minute (0 disables the limit)
  * @returns Whether rate limit is exceeded and retry-after time in seconds
  */
 export function checkRateLimit(
-  sessionId: string, 
+  sessionId: string,
   maxRequestsPerMinute = 60
 ): { limited: boolean; retryAfter: number } {
-  if (!usage[sessionId]) {
+  if (!usage[sessionId] || maxRequestsPerMinute <= 0) {
     return { limited: false, retryAfter: 0 };
   }
 
   const now = Date.now();
-  const oneMinuteAgo = now - 60 * 1000;
-  
-  // Simple rate limiting based on requests in the last minute
-  // In a production app, you'd implement a sliding window algorithm
-  if (
-    usage[sessionId].requestCount > maxRequestsPerMinute && 
-    usage[sessionId].lastRequestTime > oneMinuteAgo
-  ) {
-    const retryAfter = Math.ceil((usage[sessionId].lastRequestTime + 60 * 1000 - now) / 1000);
-    return { limited: true, retryAfter: Math.max(1, retryAfter) };
+  const windowStart = now - 60 * 1000;
+
+  const recent = usage[sessionId].requestTimestamps.filter(
+    timestamp => timestamp >= windowStart
+  );
+  usage[sessionId].requestTimestamps = recent;
+
+  if (recent.length < maxRequestsPerMinute) {
+    return { limited: false, retryAfter: 0 };
   }
-  
-  return { limited: false, retryAfter: 0 };
+
+  // The window frees up once the oldest request in it ages out.
+  const oldest = recent[0];
+  const retryAfter = Math.ceil((oldest + 60 * 1000 - now) / 1000);
+  return { limited: true, retryAfter: Math.max(1, retryAfter) };
 }
 
 /**
@@ -148,7 +165,8 @@ export function resetUsage(sessionId: string): void {
       tokenCount: 0,
       lastRequestTime: Date.now(),
       startTime: Date.now(),
-      tokenTimestamps: []
+      tokenTimestamps: [],
+      requestTimestamps: []
     };
     logger.info(`Reset usage metrics for session: ${sessionId.substring(0, 8)}...`);
   }
