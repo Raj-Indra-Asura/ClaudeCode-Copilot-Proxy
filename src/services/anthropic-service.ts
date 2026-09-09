@@ -11,6 +11,7 @@
 import fetch, { Response } from 'node-fetch';
 import { v4 as uuidv4 } from 'uuid';
 import { config } from '../config/index.js';
+import { getCopilotToken } from './auth-service.js';
 import {
   AnthropicError,
   AnthropicMessage,
@@ -515,35 +516,127 @@ export function parseToolArguments(raw: string | undefined): Record<string, unkn
 }
 
 /**
+ * Truncate text at the earliest stop sequence.
+ *
+ * Copilot accepts `stop` but does not act on it, so the Anthropic contract
+ * (text cut before the sequence, `stop_reason: 'stop_sequence'`) is enforced
+ * here instead.
+ */
+export function applyStopSequences(
+  text: string,
+  stopSequences?: string[]
+): { text: string; matched: string | null } {
+  if (!stopSequences?.length || !text) {
+    return { text, matched: null };
+  }
+
+  let bestIndex = -1;
+  let matched: string | null = null;
+
+  for (const sequence of stopSequences) {
+    if (!sequence) {
+      continue;
+    }
+    const index = text.indexOf(sequence);
+    if (index !== -1 && (bestIndex === -1 || index < bestIndex)) {
+      bestIndex = index;
+      matched = sequence;
+    }
+  }
+
+  if (bestIndex === -1) {
+    return { text, matched: null };
+  }
+
+  return { text: text.slice(0, bestIndex), matched };
+}
+
+/**
+ * Length of the trailing run that could still grow into a stop sequence.
+ *
+ * Streaming must hold this many characters back, otherwise a sequence split
+ * across two chunks would be emitted before it can be detected.
+ */
+export function pendingStopSequenceLength(text: string, stopSequences?: string[]): number {
+  if (!stopSequences?.length || !text) {
+    return 0;
+  }
+
+  let longest = 0;
+
+  for (const sequence of stopSequences) {
+    if (!sequence) {
+      continue;
+    }
+    const max = Math.min(sequence.length - 1, text.length);
+    for (let size = max; size > longest; size--) {
+      if (text.endsWith(sequence.slice(0, size))) {
+        longest = size;
+        break;
+      }
+    }
+  }
+
+  return longest;
+}
+
+/**
  * Convert a Copilot chat completion response into an Anthropic message.
  */
 export function convertCopilotToAnthropicResponse(
   data: CopilotChatResponse,
   model: string,
-  toolNameMap: Map<string, string> = new Map()
+  toolNameMap: Map<string, string> = new Map(),
+  stopSequences?: string[]
 ): AnthropicMessageResponse {
-  const choice = data?.choices?.[0];
-  const message = choice?.message;
+  // Copilot's Anthropic models split a single reply across several `choices`
+  // entries: the text lands in one and the tool_calls in another. Reading only
+  // choices[0] silently drops every tool call, which stalls Claude Code's
+  // agent loop, so all choices are merged into one Anthropic message.
+  const choices = data?.choices ?? [];
 
   const content: ContentBlock[] = [];
+  const seenToolIds = new Set<string>();
+  let stopSequenceHit: string | null = null;
 
-  const text = typeof message?.content === 'string' ? message.content : '';
-  if (text) {
-    content.push({ type: 'text', text });
-  }
-
-  for (const toolCall of message?.tool_calls ?? []) {
-    if (!toolCall?.function?.name) {
+  for (const entry of choices) {
+    const raw = typeof entry?.message?.content === 'string' ? entry.message.content : '';
+    if (!raw) {
       continue;
     }
-    const block: ToolUseBlock = {
-      type: 'tool_use',
-      id: toolCall.id || `toolu_${uuidv4().replace(/-/g, '').slice(0, 24)}`,
-      name: toolNameMap.get(toolCall.function.name) ?? toolCall.function.name,
-      input: parseToolArguments(toolCall.function.arguments),
-    };
-    content.push(block);
+    if (stopSequenceHit) {
+      break;
+    }
+    const { text, matched } = applyStopSequences(raw, stopSequences);
+    if (text) {
+      content.push({ type: 'text', text });
+    }
+    if (matched) {
+      stopSequenceHit = matched;
+    }
   }
+
+  for (const entry of choices) {
+    for (const toolCall of entry?.message?.tool_calls ?? []) {
+      if (!toolCall?.function?.name) {
+        continue;
+      }
+      const id = toolCall.id || `toolu_${uuidv4().replace(/-/g, '').slice(0, 24)}`;
+      if (seenToolIds.has(id)) {
+        continue;
+      }
+      seenToolIds.add(id);
+      const block: ToolUseBlock = {
+        type: 'tool_use',
+        id,
+        name: toolNameMap.get(toolCall.function.name) ?? toolCall.function.name,
+        input: parseToolArguments(toolCall.function.arguments),
+      };
+      content.push(block);
+    }
+  }
+
+  const choice = choices.find((entry) => entry?.finish_reason) ?? choices[0];
 
   // Anthropic clients expect at least one content block.
   if (content.length === 0) {
@@ -563,8 +656,10 @@ export function convertCopilotToAnthropicResponse(
     role: 'assistant',
     content,
     model,
-    stop_reason: mapFinishReasonToStopReason(choice?.finish_reason, hasToolUse),
-    stop_sequence: null,
+    stop_reason: stopSequenceHit
+      ? 'stop_sequence'
+      : mapFinishReasonToStopReason(choice?.finish_reason, hasToolUse),
+    stop_sequence: stopSequenceHit,
     usage,
   };
 }
@@ -572,6 +667,25 @@ export function convertCopilotToAnthropicResponse(
 // ============================================================================
 // Upstream requests
 // ============================================================================
+
+/**
+ * Resolve the chat endpoint for the signed-in account.
+ *
+ * Individual, business and enterprise plans are served from different hosts
+ * (e.g. `api.individual.githubcopilot.com`), advertised by the token response.
+ */
+export function resolveCopilotChatEndpoint(): string {
+  if (config.copilot.chatEndpointOverride) {
+    return config.copilot.chatEndpointOverride;
+  }
+
+  const api = getCopilotToken()?.endpoints?.api;
+  if (api) {
+    return `${api.replace(/\/+$/, '')}/chat/completions`;
+  }
+
+  return config.github.copilot.anthropicEndpoints.COPILOT_ANTHROPIC_CHAT;
+}
 
 /**
  * Send a request to GitHub Copilot's chat endpoint.
@@ -597,7 +711,7 @@ async function postToCopilot(
     stream,
   });
 
-  const response = await fetch(config.github.copilot.anthropicEndpoints.COPILOT_ANTHROPIC_CHAT, {
+  const response = await fetch(resolveCopilotChatEndpoint(), {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -658,7 +772,12 @@ export async function makeAnthropicCompletionRequest(
 ): Promise<AnthropicMessageResponse> {
   const response = await postToCopilot(request, copilotToken, false);
   const data = (await response.json()) as CopilotChatResponse;
-  return convertCopilotToAnthropicResponse(data, request.model, buildToolNameMap(request.tools));
+  return convertCopilotToAnthropicResponse(
+    data,
+    request.model,
+    buildToolNameMap(request.tools),
+    request.stop_sequences
+  );
 }
 
 /**
@@ -744,6 +863,7 @@ export async function* streamAnthropicMessage(
       model: request.model,
       toolNameMap,
       estimatedInputTokens: estimateInputTokens(request.messages, request.system, request.tools),
+      stopSequences: request.stop_sequences,
     }
   );
 }
@@ -764,10 +884,12 @@ export async function* convertCopilotStreamToAnthropicEvents(
     model: string;
     toolNameMap?: Map<string, string>;
     estimatedInputTokens?: number;
+    stopSequences?: string[];
   }
 ): AsyncGenerator<AnthropicStreamEvent> {
   const { messageId, model } = options;
   const toolNameMap = options.toolNameMap ?? new Map<string, string>();
+  const stopSequences = options.stopSequences;
 
   let inputTokens = options.estimatedInputTokens ?? 0;
   let outputTokens = 0;
@@ -775,6 +897,9 @@ export async function* convertCopilotStreamToAnthropicEvents(
   let textBlockIndex: number | null = null;
   let nextBlockIndex = 0;
   let finishReason: string | null = null;
+  // Text received but withheld because it may still complete a stop sequence.
+  let pendingText = '';
+  let stopSequenceHit: string | null = null;
   const toolCalls = new Map<number, StreamingToolCall>();
 
   const emitMessageStart = function* (): Generator<AnthropicStreamEvent> {
@@ -830,11 +955,35 @@ export async function* convertCopilotStreamToAnthropicEvents(
       }
 
       outputTokens += Math.ceil(delta.content.length / CHARS_PER_TOKEN);
-      yield {
-        type: 'content_block_delta',
-        index: textBlockIndex,
-        delta: { type: 'text_delta', text: delta.content },
-      };
+
+      // `pendingText` only ever holds text that has not been emitted yet.
+      pendingText += delta.content;
+      const { text: safeText, matched } = applyStopSequences(pendingText, stopSequences);
+
+      if (matched) {
+        stopSequenceHit = matched;
+        pendingText = '';
+        if (safeText) {
+          yield {
+            type: 'content_block_delta',
+            index: textBlockIndex,
+            delta: { type: 'text_delta', text: safeText },
+          };
+        }
+        break;
+      }
+
+      const hold = pendingStopSequenceLength(pendingText, stopSequences);
+      const emitText = hold > 0 ? pendingText.slice(0, pendingText.length - hold) : pendingText;
+      pendingText = hold > 0 ? pendingText.slice(pendingText.length - hold) : '';
+
+      if (emitText) {
+        yield {
+          type: 'content_block_delta',
+          index: textBlockIndex,
+          delta: { type: 'text_delta', text: emitText },
+        };
+      }
     }
 
     for (const toolDelta of delta.tool_calls ?? []) {
@@ -887,6 +1036,16 @@ export async function* convertCopilotStreamToAnthropicEvents(
 
   yield* emitMessageStart();
 
+  // No stop sequence arrived, so the withheld tail was ordinary text.
+  if (pendingText && textBlockIndex !== null) {
+    yield {
+      type: 'content_block_delta',
+      index: textBlockIndex,
+      delta: { type: 'text_delta', text: pendingText },
+    };
+    pendingText = '';
+  }
+
   if (textBlockIndex !== null) {
     yield { type: 'content_block_stop', index: textBlockIndex };
   } else if (toolCalls.size === 0) {
@@ -907,8 +1066,10 @@ export async function* convertCopilotStreamToAnthropicEvents(
   yield {
     type: 'message_delta',
     delta: {
-      stop_reason: mapFinishReasonToStopReason(finishReason, toolCalls.size > 0),
-      stop_sequence: null,
+      stop_reason: stopSequenceHit
+        ? 'stop_sequence'
+        : mapFinishReasonToStopReason(finishReason, toolCalls.size > 0),
+      stop_sequence: stopSequenceHit,
     },
     usage: { input_tokens: inputTokens, output_tokens: outputTokens },
   };

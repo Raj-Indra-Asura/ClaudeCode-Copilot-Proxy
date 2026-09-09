@@ -1,5 +1,6 @@
 import { Readable } from 'stream';
 import {
+  applyStopSequences,
   buildCopilotChatRequest,
   convertCopilotStreamToAnthropicEvents,
   buildToolNameMap,
@@ -15,6 +16,7 @@ import {
   normalizeSystemPrompt,
   parseCopilotSseStream,
   parseToolArguments,
+  pendingStopSequenceLength,
   requestHasImages,
   sanitizeToolName,
 } from './anthropic-service.js';
@@ -227,7 +229,7 @@ describe('Anthropic Service', () => {
         { stream: true }
       );
 
-      expect(body.model).toBe('claude-sonnet-4.5');
+      expect(body.model).toBe('claude-sonnet-5');
       expect(body.stream).toBe(true);
       expect(body.max_tokens).toBe(1024);
       expect(body.temperature).toBe(0.2);
@@ -329,9 +331,79 @@ describe('Anthropic Service', () => {
       ]);
     });
 
+    it('merges text and tool calls that Copilot splits across separate choices', () => {
+      // Copilot's Anthropic models return the assistant text in one choice and
+      // the tool_calls in another; reading only choices[0] drops the tool call.
+      const result = convertCopilotToAnthropicResponse(
+        {
+          choices: [
+            {
+              message: { role: 'assistant', content: "I'll check the weather." },
+              finish_reason: 'tool_calls',
+            },
+            {
+              message: {
+                role: 'assistant',
+                tool_calls: [
+                  {
+                    id: 'toolu_abc',
+                    type: 'function',
+                    function: { name: 'get_weather', arguments: '{"location":"Paris"}' },
+                  },
+                ],
+              },
+              finish_reason: 'tool_calls',
+            },
+          ],
+        },
+        'claude-opus-5'
+      );
+
+      expect(result.stop_reason).toBe('tool_use');
+      expect(result.content).toEqual([
+        { type: 'text', text: "I'll check the weather." },
+        { type: 'tool_use', id: 'toolu_abc', name: 'get_weather', input: { location: 'Paris' } },
+      ]);
+    });
+
     it('always returns at least one content block', () => {
       const result = convertCopilotToAnthropicResponse({ choices: [] }, 'claude-sonnet-4-5');
       expect(result.content).toEqual([{ type: 'text', text: '' }]);
+    });
+
+    it('truncates at a stop sequence, which Copilot ignores upstream', () => {
+      const result = convertCopilotToAnthropicResponse(
+        {
+          choices: [
+            { message: { role: 'assistant', content: '1, 2, 3, 4, 5, 6' }, finish_reason: 'stop' },
+          ],
+        },
+        'claude-sonnet-5',
+        new Map(),
+        ['4']
+      );
+
+      expect(result.content).toEqual([{ type: 'text', text: '1, 2, 3, ' }]);
+      expect(result.stop_reason).toBe('stop_sequence');
+      expect(result.stop_sequence).toBe('4');
+    });
+  });
+
+  describe('stop sequence helpers', () => {
+    it('cuts at the earliest matching sequence', () => {
+      expect(applyStopSequences('abcXdefY', ['Y', 'X'])).toEqual({ text: 'abc', matched: 'X' });
+      expect(applyStopSequences('no match here', ['ZZ'])).toEqual({
+        text: 'no match here',
+        matched: null,
+      });
+      expect(applyStopSequences('text', undefined)).toEqual({ text: 'text', matched: null });
+    });
+
+    it('reports how much text must be withheld mid-stream', () => {
+      // 'ST' could still become 'STOP' once the next chunk arrives.
+      expect(pendingStopSequenceLength('some ST', ['STOP'])).toBe(2);
+      expect(pendingStopSequenceLength('done', ['STOP'])).toBe(0);
+      expect(pendingStopSequenceLength('anything', undefined)).toBe(0);
     });
   });
 
@@ -442,6 +514,60 @@ describe('Anthropic Service', () => {
       }
       return events;
     }
+
+    it('applies stop sequences split across chunk boundaries', async () => {
+      const events = [];
+      for await (const event of convertCopilotStreamToAnthropicEvents(
+        source([
+          { choices: [{ delta: { content: 'keep this ST' } }] },
+          { choices: [{ delta: { content: 'OP drop this' } }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }] },
+        ]),
+        { messageId: 'msg_test', model: 'claude-sonnet-5', stopSequences: ['STOP'] }
+      )) {
+        events.push(event);
+      }
+
+      const text = events
+        .filter(
+          (e): e is Extract<typeof e, { type: 'content_block_delta' }> =>
+            e.type === 'content_block_delta'
+        )
+        .map((d) => ('text' in d.delta ? d.delta.text : ''))
+        .join('');
+
+      // 'ST' must be withheld until the next chunk proves it is 'STOP'.
+      expect(text).toBe('keep this ');
+
+      const messageDelta = events.find(
+        (e): e is Extract<typeof e, { type: 'message_delta' }> => e.type === 'message_delta'
+      );
+      expect(messageDelta?.delta.stop_reason).toBe('stop_sequence');
+      expect(messageDelta?.delta.stop_sequence).toBe('STOP');
+    });
+
+    it('flushes withheld text when no stop sequence arrives', async () => {
+      const events = [];
+      for await (const event of convertCopilotStreamToAnthropicEvents(
+        source([
+          { choices: [{ delta: { content: 'ends with ST' } }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }] },
+        ]),
+        { messageId: 'msg_test', model: 'claude-sonnet-5', stopSequences: ['STOP'] }
+      )) {
+        events.push(event);
+      }
+
+      const text = events
+        .filter(
+          (e): e is Extract<typeof e, { type: 'content_block_delta' }> =>
+            e.type === 'content_block_delta'
+        )
+        .map((d) => ('text' in d.delta ? d.delta.text : ''))
+        .join('');
+
+      expect(text).toBe('ends with ST');
+    });
 
     it('emits a well-formed text stream', async () => {
       const events = await collectEvents([

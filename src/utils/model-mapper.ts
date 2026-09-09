@@ -4,7 +4,12 @@
  * Supports Claude, GPT, Gemini, and other models available in Copilot.
  */
 
-import { AVAILABLE_CLAUDE_MODELS, CLAUDE_MODEL_MAPPINGS, config } from '../config/index.js';
+import {
+  AVAILABLE_CLAUDE_MODELS,
+  CLAUDE_MODEL_MAPPINGS,
+  COPILOT_ANTHROPIC_MODELS,
+  config,
+} from '../config/index.js';
 import { AnthropicModel, AnthropicModelList } from '../types/anthropic.js';
 
 /**
@@ -13,7 +18,7 @@ import { AnthropicModel, AnthropicModelList } from '../types/anthropic.js';
  * Claude Code sends dated identifiers (`claude-sonnet-4-5-20250929`) and short
  * aliases (`sonnet`, `haiku`, `opusplan`). Matching is done longest-prefix
  * first so `claude-sonnet-4-5-...` never falls back to the `claude-sonnet-4`
- * entry.
+ * entry. Copilot serves its own model IDs, not Anthropic's public names.
  *
  * @param model - The requested model name
  * @returns The corresponding Copilot model name
@@ -25,12 +30,18 @@ export function mapClaudeModelToCopilot(model: string): string {
 
   const normalized = model.trim().toLowerCase();
 
+  // A live Copilot model ID is forwarded verbatim. Checked before prefix
+  // matching so 'claude-opus-4.7' is not rewritten by the 'claude-opus-4' key.
+  if (COPILOT_ANTHROPIC_MODELS.includes(normalized)) {
+    return normalized;
+  }
+
   const direct = CLAUDE_MODEL_MAPPINGS[normalized];
   if (direct) {
     return direct;
   }
 
-  // Already a Copilot model identifier (e.g. "claude-sonnet-4.5").
+  // Already a Copilot model identifier (e.g. "claude-sonnet-5").
   if (Object.values(CLAUDE_MODEL_MAPPINGS).includes(normalized)) {
     return normalized;
   }
@@ -66,6 +77,10 @@ export function isValidClaudeModel(model: string): boolean {
   }
 
   const normalized = model.trim().toLowerCase();
+
+  if (COPILOT_ANTHROPIC_MODELS.includes(normalized)) {
+    return true;
+  }
 
   if (CLAUDE_MODEL_MAPPINGS[normalized]) {
     return true;

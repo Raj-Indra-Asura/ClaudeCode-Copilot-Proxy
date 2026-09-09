@@ -11,6 +11,12 @@ export interface CopilotToken {
   sku: string;
   telemetry: string;
   tracking_id: string;
+  /** Account-specific API hosts; individual/business/enterprise plans differ. */
+  endpoints?: {
+    api?: string;
+    proxy?: string;
+    telemetry?: string;
+  };
 }
 
 export interface VerificationResponse {

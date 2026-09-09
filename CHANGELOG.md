@@ -11,7 +11,7 @@
 - **Image support**: `base64` and `url` image blocks become data URIs and set the
   `Copilot-Vision-Request` header.
 - Support for the block-array form of `system` that Claude Code sends.
-- Pass-through of `temperature`, `top_p` and `stop_sequences`.
+- Pass-through of `temperature` and `top_p`, and local enforcement of `stop_sequences`.
 - `GET /v1/models/:model`, and `GET /v1/models` now returns Anthropic's pagination envelope.
 - `src/types/copilot-chat.ts` describing Copilot's chat-completions dialect.
 - Configurable Copilot endpoint, client identity headers, default model, output-token
@@ -20,6 +20,21 @@
 - `npm run typecheck` and `npm run lint:fix` scripts.
 
 ### Fixed
+- **Stale Copilot model identifiers.** Every mapped Claude model except
+  `claude-haiku-4.5` had been retired upstream and returned
+  `400 model_not_supported`. Verified against a live account and remapped onto
+  `claude-opus-5` / `claude-sonnet-5` / `claude-haiku-4.5`.
+- **Tool calls were silently dropped in non-streaming responses.** Copilot splits a
+  reply across several `choices` entries (text in one, `tool_calls` in another) and
+  only `choices[0]` was read, which stalled Claude Code's agent loop. All choices are
+  now merged into a single Anthropic message.
+- **`stop_sequences` were ignored.** Copilot accepts the `stop` parameter but does not
+  act on it, so sequences are now enforced locally in both the buffered and streaming
+  paths, including sequences split across chunk boundaries, and reported as
+  `stop_reason: "stop_sequence"`.
+- **Hardcoded chat endpoint.** The account-specific host advertised by the Copilot token
+  (e.g. `api.individual.githubcopilot.com`) is now used, with `COPILOT_CHAT_ENDPOINT`
+  left as an explicit override.
 - **Missing `Copilot-Integration-Id` header**, which caused the Copilot chat endpoint to
   reject requests.
 - **Rate limiter compared the cumulative request count** against the per-minute limit,

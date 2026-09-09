@@ -19,8 +19,8 @@ This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get sta
 ┌─────────────────┐     ┌──────────────────────────┐     ┌─────────────────────┐
 │   Claude Code   │────▶│   Copilot Proxy Server   │────▶│  GitHub Copilot API │
 │  (Anthropic API │     │                          │     │  (Anthropic Models) │
-│     format)     │     │  - Auth (OAuth device)   │     │  - claude-opus-4.5  │
-└─────────────────┘     │  - Request translation   │     │  - claude-sonnet-4  │
+│     format)     │     │  - Auth (OAuth device)   │     │  - claude-opus-5    │
+└─────────────────┘     │  - Request translation   │     │  - claude-sonnet-5  │
                         │  - Response translation  │     │  - etc.             │
                         │  - Streaming support     │     └─────────────────────┘
                         └──────────────────────────┘
@@ -47,7 +47,7 @@ endpoint, so the translation is Anthropic Messages API ⇄ OpenAI chat completio
 
 | Anthropic field | Copilot equivalent |
 |-----------------|--------------------|
-| `model` (e.g. `claude-sonnet-4-5-20250929`) | Mapped to `claude-sonnet-4.5` (longest-prefix match) |
+| `model` (e.g. `claude-sonnet-4-5-20250929`) | Mapped to `claude-sonnet-5` (longest-prefix match) |
 | `messages` | `messages` array, roles preserved |
 | `system` (string or text blocks) | Leading `system` message |
 | `content` text blocks | `content` string, or multimodal parts when images are present |
@@ -57,13 +57,28 @@ endpoint, so the translation is Anthropic Messages API ⇄ OpenAI chat completio
 | assistant `tool_use` blocks | assistant `tool_calls` |
 | user `tool_result` blocks | standalone `role: 'tool'` messages placed before the user text |
 | `max_tokens`, `temperature`, `top_p` | Same names |
-| `stop_sequences` | `stop` |
+| `stop_sequences` | Sent as `stop`, but Copilot ignores it — enforced locally instead |
 | `stream` | `stream`, with SSE translated back into Anthropic events |
 | `cache_control`, `thinking` | Accepted and ignored (no Copilot equivalent) |
 
 **Required upstream headers** (see `buildCopilotHeaders`): `Copilot-Integration-Id`,
 `Editor-Version`, `Editor-Plugin-Version`, `Machine-Id`, and `Copilot-Vision-Request`
-when the request contains images. Omitting `Copilot-Integration-Id` causes rejections.
+when the request contains images. Omitting `Editor-Version` fails with
+`missing Editor-Version header for IDE auth`.
+
+`X-Github-Api-Version: 2025-05-01` is validated upstream — an unrecognised value is
+rejected with `invalid apiVersion`, so it cannot be changed casually.
+
+**Endpoint**: resolved from the Copilot token's `endpoints.api`, which is
+account-specific (`api.individual.githubcopilot.com` for individual plans).
+
+**Model IDs**: Copilot serves its own Anthropic model IDs and retires them quickly;
+it does *not* accept Anthropic's public names. Verify with `GET {endpoints.api}/models`
+before changing `CLAUDE_MODEL_MAPPINGS` — a wrong string fails with
+`400 model_not_supported`.
+
+**Response shape**: a tool-calling reply is split across multiple `choices` entries
+(text in one, `tool_calls` in another). Never read only `choices[0]`.
 
 ### Configuration for Claude Code
 

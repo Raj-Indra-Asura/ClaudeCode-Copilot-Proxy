@@ -9,45 +9,47 @@ import {
 describe('Model Mapper', () => {
   describe('mapClaudeModelToCopilot', () => {
     it('maps the dated identifiers Claude Code sends', () => {
-      expect(mapClaudeModelToCopilot('claude-opus-4-5-20251101')).toBe('claude-opus-4.5');
-      expect(mapClaudeModelToCopilot('claude-sonnet-4-5-20250929')).toBe('claude-sonnet-4.5');
+      expect(mapClaudeModelToCopilot('claude-opus-4-5-20251101')).toBe('claude-opus-5');
+      expect(mapClaudeModelToCopilot('claude-sonnet-4-5-20250929')).toBe('claude-sonnet-5');
       expect(mapClaudeModelToCopilot('claude-haiku-4-5-20251001')).toBe('claude-haiku-4.5');
     });
 
     it('prefers the longest matching prefix', () => {
-      // Must not collapse to the shorter `claude-sonnet-4` entry.
-      expect(mapClaudeModelToCopilot('claude-sonnet-4-5')).toBe('claude-sonnet-4.5');
-      expect(mapClaudeModelToCopilot('claude-sonnet-4-20250514')).toBe('claude-sonnet-4');
+      expect(mapClaudeModelToCopilot('claude-sonnet-4-5')).toBe('claude-sonnet-5');
+      expect(mapClaudeModelToCopilot('claude-sonnet-4-20250514')).toBe('claude-sonnet-5');
     });
 
     it('maps the short aliases', () => {
-      expect(mapClaudeModelToCopilot('sonnet')).toBe('claude-sonnet-4.5');
+      expect(mapClaudeModelToCopilot('sonnet')).toBe('claude-sonnet-5');
       expect(mapClaudeModelToCopilot('haiku')).toBe('claude-haiku-4.5');
-      expect(mapClaudeModelToCopilot('opus')).toBe('claude-opus-4.5');
-      expect(mapClaudeModelToCopilot('opusplan')).toBe('claude-opus-4.5');
+      expect(mapClaudeModelToCopilot('opus')).toBe('claude-opus-5');
+      expect(mapClaudeModelToCopilot('opusplan')).toBe('claude-opus-5');
     });
 
-    it('accepts Copilot model identifiers unchanged', () => {
-      expect(mapClaudeModelToCopilot('claude-sonnet-4.5')).toBe('claude-sonnet-4.5');
+    it('forwards live Copilot model identifiers unchanged', () => {
+      expect(mapClaudeModelToCopilot('claude-sonnet-5')).toBe('claude-sonnet-5');
+      // Must not be rewritten by the shorter 'claude-opus-4' mapping key.
+      expect(mapClaudeModelToCopilot('claude-opus-4.7')).toBe('claude-opus-4.7');
+      expect(mapClaudeModelToCopilot('claude-opus-4.8-fast')).toBe('claude-opus-4.8-fast');
     });
 
     it('falls back to the default for unknown Claude models', () => {
-      expect(mapClaudeModelToCopilot('claude-something-new-2099')).toBe('claude-sonnet-4.5');
-      expect(mapClaudeModelToCopilot('')).toBe('claude-sonnet-4.5');
+      expect(mapClaudeModelToCopilot('claude-something-new-2099')).toBe('claude-sonnet-5');
+      expect(mapClaudeModelToCopilot('')).toBe('claude-sonnet-5');
     });
 
     it('passes non-Claude models through untouched', () => {
-      expect(mapClaudeModelToCopilot('gpt-5.2')).toBe('gpt-5.2');
-      expect(mapClaudeModelToCopilot('gemini-3-pro-preview')).toBe('gemini-3-pro-preview');
+      expect(mapClaudeModelToCopilot('gpt-5.5')).toBe('gpt-5.5');
+      expect(mapClaudeModelToCopilot('gemini-3.8-flash')).toBe('gemini-3.8-flash');
     });
   });
 
   describe('isValidClaudeModel', () => {
     it('recognises aliases, Copilot names and unknown Claude variants', () => {
       expect(isValidClaudeModel('sonnet')).toBe(true);
-      expect(isValidClaudeModel('claude-sonnet-4.5')).toBe(true);
+      expect(isValidClaudeModel('claude-sonnet-5')).toBe(true);
       expect(isValidClaudeModel('claude-future-9')).toBe(true);
-      expect(isValidClaudeModel('gpt-5.2')).toBe(false);
+      expect(isValidClaudeModel('gpt-5.5')).toBe(false);
       expect(isValidClaudeModel('')).toBe(false);
     });
   });
@@ -71,16 +73,16 @@ describe('Model Mapper', () => {
     it('advertises the current Claude models', () => {
       const ids = getAvailableModels().data.map((model) => model.id);
       expect(ids).toEqual(expect.arrayContaining([
-        'claude-opus-4-5',
-        'claude-sonnet-4-5',
-        'claude-haiku-4-5',
+        'claude-opus-5',
+        'claude-sonnet-5',
+        'claude-haiku-4.5',
       ]));
     });
   });
 
   describe('getModelById', () => {
     it('resolves advertised models and dated aliases', () => {
-      expect(getModelById('claude-sonnet-4-5')?.id).toBe('claude-sonnet-4-5');
+      expect(getModelById('claude-sonnet-5')?.id).toBe('claude-sonnet-5');
       expect(getModelById('claude-sonnet-4-5-20250929')?.id).toBe('claude-sonnet-4-5-20250929');
     });
 
@@ -91,7 +93,7 @@ describe('Model Mapper', () => {
 
   describe('getModelDisplayName', () => {
     it('uses the configured display name when available', () => {
-      expect(getModelDisplayName('claude-sonnet-4-5')).toBe('Claude Sonnet 4.5');
+      expect(getModelDisplayName('claude-sonnet-5')).toBe('Claude Sonnet 5');
     });
 
     it('derives a readable name otherwise', () => {
