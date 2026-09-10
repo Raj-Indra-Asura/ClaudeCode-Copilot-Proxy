@@ -99,10 +99,13 @@ export type AnthropicSystemPrompt = string | TextBlock[];
 // ============================================================================
 
 /**
- * A message in the conversation
+ * A message in the conversation.
+ *
+ * `system` is only valid under the `mid-conversation-system-2026-04-07` beta,
+ * which Claude Code uses to append instructions after the initial user turn.
  */
 export interface AnthropicMessage {
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   content: string | ContentBlock[];
 }
 

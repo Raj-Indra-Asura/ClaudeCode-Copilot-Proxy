@@ -70,6 +70,32 @@ describe('Anthropic Service', () => {
       ]);
     });
 
+    it('keeps mid-conversation system messages as system messages', () => {
+      const messages: AnthropicMessage[] = [
+        { role: 'user', content: 'hi' },
+        { role: 'system', content: 'extra instructions' },
+        { role: 'system', content: [{ type: 'text', text: 'block form' }] },
+      ];
+
+      expect(convertAnthropicMessagesToCopilot(messages)).toEqual([
+        { role: 'user', content: 'hi' },
+        { role: 'system', content: 'extra instructions' },
+        { role: 'system', content: 'block form' },
+      ]);
+    });
+
+    it('drops empty system messages', () => {
+      const messages: AnthropicMessage[] = [
+        { role: 'system', content: '' },
+        { role: 'system', content: [] },
+        { role: 'user', content: 'hi' },
+      ];
+
+      expect(convertAnthropicMessagesToCopilot(messages)).toEqual([
+        { role: 'user', content: 'hi' },
+      ]);
+    });
+
     it('converts assistant tool_use blocks into tool_calls', () => {
       const messages: AnthropicMessage[] = [
         { role: 'user', content: 'read the file' },

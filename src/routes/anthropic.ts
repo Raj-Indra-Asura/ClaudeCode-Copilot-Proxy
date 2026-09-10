@@ -92,10 +92,11 @@ function validateMessageRequest(request: AnthropicMessageRequest): AnthropicErro
   }
 
   for (const message of request.messages) {
-    if (!message || !['user', 'assistant'].includes(message.role)) {
+    // `system` is permitted by the mid-conversation-system beta that Claude Code sends.
+    if (!message || !['user', 'assistant', 'system'].includes(message.role)) {
       return createAnthropicError(
         'invalid_request_error',
-        'messages: each message must have a valid role (user or assistant)'
+        'messages: each message must have a valid role (user, assistant or system)'
       );
     }
     if (message.content === undefined || message.content === null) {

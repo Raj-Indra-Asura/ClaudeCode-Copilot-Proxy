@@ -51,6 +51,7 @@ endpoint, so the translation is Anthropic Messages API ⇄ OpenAI chat completio
 | `model` (e.g. `claude-sonnet-4-5-20250929`) | Mapped to `claude-sonnet-5` (longest-prefix match) |
 | `messages` | `messages` array, roles preserved |
 | `system` (string or text blocks) | Leading `system` message |
+| `messages` entry with `role: 'system'` | Inline `system` message, kept in place (Claude Code's `mid-conversation-system-2026-04-07` beta) |
 | `content` text blocks | `content` string, or multimodal parts when images are present |
 | `content` image blocks | `image_url` parts with a `data:` URI |
 | `tools` | `tools` (function definitions); names sanitised to `[A-Za-z0-9_-]` |

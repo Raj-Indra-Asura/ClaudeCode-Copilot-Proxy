@@ -294,8 +294,8 @@ export function convertAnthropicMessagesToCopilot(
     }
 
     if (typeof message.content === 'string') {
-      // An empty assistant turn would be rejected upstream; skip it.
-      if (message.content.length === 0 && message.role === 'assistant') {
+      // An empty assistant or system turn would be rejected upstream; skip it.
+      if (message.content.length === 0 && message.role !== 'user') {
         continue;
       }
       result.push({ role: message.role, content: message.content });
@@ -303,6 +303,20 @@ export function convertAnthropicMessagesToCopilot(
     }
 
     const blocks = Array.isArray(message.content) ? message.content : [];
+
+    if (message.role === 'system') {
+      // Mid-conversation system turns carry plain instructions; flatten their
+      // text blocks so they are not misfiled as a user turn below.
+      const text = blocks
+        .filter((block): block is TextBlock => block?.type === 'text')
+        .map((block) => block.text)
+        .join('\n');
+
+      if (text.length > 0) {
+        result.push({ role: 'system', content: text });
+      }
+      continue;
+    }
 
     if (message.role === 'assistant') {
       const textParts: string[] = [];
