@@ -229,8 +229,8 @@ Put this in it:
     "ANTHROPIC_AUTH_TOKEN": "sk-dummy",
     "ANTHROPIC_MODEL": "sonnet",
     "ANTHROPIC_SMALL_FAST_MODEL": "haiku",
-    "DISABLE_NON_ESSENTIAL_MODEL_CALLS": "1",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+    "DISABLE_NON_ESSENTIAL_MODEL_CALLS": "1"
   }
 }
 ```
@@ -241,7 +241,34 @@ What each line does:
 - `ANTHROPIC_AUTH_TOKEN` — a deliberate placeholder. Claude Code refuses to start without *some* value, but the proxy authorises using your GitHub Copilot token. Leave it as `sk-dummy`.
 - `ANTHROPIC_MODEL` — your everyday model. `sonnet` is the best balance of cost and capability.
 - `ANTHROPIC_SMALL_FAST_MODEL` — the cheap model for background chores like conversation titles.
-- The two `DISABLE_*` flags — suppress telemetry and non-essential model calls, which directly reduces premium-request usage.
+- `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` — makes Claude Code call `GET /v1/models` on the proxy and list every model your Copilot plan can reach in `/model`. Without it the picker only ever offers the three alias slots (opus/sonnet/haiku).
+- `DISABLE_NON_ESSENTIAL_MODEL_CALLS` — suppresses background chores such as conversation titles, which directly reduces premium-request usage. It does **not** interfere with model discovery.
+
+> **Do not set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`.** It silently disables the
+> `GET /v1/models` discovery call, so `/model` will never show more than the three
+> alias slots. Claude Code logs `[Bootstrap] Skipped: Nonessential traffic disabled`
+> when this happens.
+
+### Seeing every model in `/model`
+
+With discovery enabled, Claude Code caches the proxy's catalog in
+`~/.claude/cache/gateway-models.json` and adds one `From gateway` entry per model.
+Two things commonly hide them:
+
+- **An `availableModels` allowlist** in `settings.json` filters the picker. Because it
+  matches literal model IDs, a list such as `["default","opus","sonnet","haiku"]`
+  removes every discovered model. Omit the key entirely unless you deliberately want
+  to restrict the list — it would otherwise need editing each time Copilot retires an ID.
+- **The cached `baseUrl` must match `ANTHROPIC_BASE_URL` exactly**, trailing slash
+  included, or the cache is ignored.
+
+Discovery is asynchronous and cache-backed, so the *first* run after enabling it may
+still show the old picker; the models appear on the next run.
+
+Some newer models (currently the Fable family) are gated by GitHub Copilot on the
+Claude Code version, which it reads from the `cc_version=...` billing header Claude
+Code puts in its system prompt. If a model returns
+`Claude Code <version> does not support this model`, run `claude update`.
 
 If the folder does not exist yet, create it first:
 
