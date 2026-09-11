@@ -21,63 +21,87 @@ interface ApiKeyUsage {
   [key: string]: UsageMetrics;
 }
 
-const usage: ApiKeyUsage = {};
+export const USAGE_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+export const MAX_USAGE_SESSIONS = 1000;
+const usage = new Map<string, UsageMetrics>();
+
+function pruneSessions(): void {
+  const cutoff = Date.now() - USAGE_SESSION_TTL_MS;
+  for (const [id, metrics] of usage) {
+    if (metrics.lastRequestTime > cutoff) {
+      break;
+    }
+    usage.delete(id);
+  }
+}
+
+function touchSession(sessionId: string, metrics: UsageMetrics): void {
+  metrics.lastRequestTime = Date.now();
+  usage.delete(sessionId);
+  usage.set(sessionId, metrics);
+}
+
+function pruneWindows(metrics: UsageMetrics, now: number): void {
+  metrics.tokenTimestamps = metrics.tokenTimestamps.filter(
+    entry => entry.timestamp > now - 5 * 60 * 1000
+  );
+  metrics.requestTimestamps = metrics.requestTimestamps.filter(
+    timestamp => timestamp > now - 60 * 1000
+  );
+}
 
 /**
  * Initialize usage metrics for a session
  * @param sessionId Unique identifier for the session (typically a hashed token or IP)
  */
 export function initializeUsage(sessionId: string): void {
-  if (!usage[sessionId]) {
-    usage[sessionId] = {
+  pruneSessions();
+  if (!usage.has(sessionId)) {
+    if (usage.size >= MAX_USAGE_SESSIONS) {
+      usage.delete(usage.keys().next().value as string);
+    }
+    usage.set(sessionId, {
       requestCount: 0,
       tokenCount: 0,
       lastRequestTime: Date.now(),
       startTime: Date.now(),
       tokenTimestamps: [],
       requestTimestamps: []
-    };
-    logger.debug(`Initialized usage tracking for session: ${sessionId.substring(0, 8)}...`);
+    });
   }
 }
 
 /**
  * Track a request for usage metrics
  * @param sessionId Unique identifier for the session
- * @param tokenCount Number of tokens used in the request
  */
-export function trackRequest(sessionId: string, tokenCount = 0): void {
-  if (!usage[sessionId]) {
-    initializeUsage(sessionId);
-  }
-  
+export function trackRequest(sessionId: string): void {
+  initializeUsage(sessionId);
+  const metrics = usage.get(sessionId)!;
   const now = Date.now();
-  usage[sessionId].requestCount += 1;
-  usage[sessionId].tokenCount += tokenCount;
-  usage[sessionId].lastRequestTime = now;
-  usage[sessionId].requestTimestamps.push(now);
-  
-  // Record token usage with timestamp for rate limiting over time
-  if (tokenCount > 0) {
-    usage[sessionId].tokenTimestamps.push({
-      tokens: tokenCount,
-      timestamp: now
-    });
-  }
-  
-  // Clean up old token timestamps (older than 5 minutes)
-  const fiveMinutesAgo = now - 5 * 60 * 1000;
-  usage[sessionId].tokenTimestamps = usage[sessionId].tokenTimestamps.filter(
-    entry => entry.timestamp >= fiveMinutesAgo
-  );
+  metrics.requestCount += 1;
+  metrics.requestTimestamps.push(now);
+  touchSession(sessionId, metrics);
+  pruneWindows(metrics, now);
+}
 
-  // Keep only the request timestamps inside the rate-limit window
-  const oneMinuteAgo = now - 60 * 1000;
-  usage[sessionId].requestTimestamps = usage[sessionId].requestTimestamps.filter(
-    timestamp => timestamp >= oneMinuteAgo
-  );
-  
-  logger.debug(`Tracked request for session ${sessionId.substring(0, 8)}...: +${tokenCount} tokens`);
+/** Record token usage without charging another request to the rate limit. */
+export function trackTokens(sessionId: string, tokenCount: number): void {
+  if (!Number.isFinite(tokenCount) || tokenCount <= 0) {
+    return;
+  }
+  initializeUsage(sessionId);
+  const metrics = usage.get(sessionId)!;
+  const now = Date.now();
+  metrics.tokenCount += tokenCount;
+  const latest = metrics.tokenTimestamps[metrics.tokenTimestamps.length - 1];
+  if (latest?.timestamp === now) {
+    latest.tokens += tokenCount;
+  } else {
+    metrics.tokenTimestamps.push({ tokens: tokenCount, timestamp: now });
+  }
+  touchSession(sessionId, metrics);
+  pruneWindows(metrics, now);
 }
 
 /**
@@ -86,7 +110,12 @@ export function trackRequest(sessionId: string, tokenCount = 0): void {
  * @returns Usage metrics or null if session not found
  */
 export function getUsage(sessionId: string): UsageMetrics | null {
-  return usage[sessionId] || null;
+  pruneSessions();
+  const metrics = usage.get(sessionId);
+  if (metrics) {
+    pruneWindows(metrics, Date.now());
+  }
+  return metrics || null;
 }
 
 /**
@@ -94,7 +123,8 @@ export function getUsage(sessionId: string): UsageMetrics | null {
  * @returns All usage metrics
  */
 export function getAllUsage(): ApiKeyUsage {
-  return { ...usage };
+  pruneSessions();
+  return Object.fromEntries(usage);
 }
 
 /**
@@ -104,7 +134,8 @@ export function getAllUsage(): ApiKeyUsage {
  * @returns Token count within the specified window
  */
 export function getTokenUsageInWindow(sessionId: string, windowMs: number): number {
-  if (!usage[sessionId]) {
+  const metrics = getUsage(sessionId);
+  if (!metrics) {
     return 0;
   }
   
@@ -112,8 +143,8 @@ export function getTokenUsageInWindow(sessionId: string, windowMs: number): numb
   const windowStart = now - windowMs;
   
   // Sum up tokens used within the window
-  return usage[sessionId].tokenTimestamps
-    .filter(entry => entry.timestamp >= windowStart)
+  return metrics.tokenTimestamps
+    .filter(entry => entry.timestamp > windowStart)
     .reduce((sum, entry) => sum + entry.tokens, 0);
 }
 
@@ -132,17 +163,18 @@ export function checkRateLimit(
   sessionId: string,
   maxRequestsPerMinute = 60
 ): { limited: boolean; retryAfter: number } {
-  if (!usage[sessionId] || maxRequestsPerMinute <= 0) {
+  const metrics = getUsage(sessionId);
+  if (!metrics || maxRequestsPerMinute <= 0) {
     return { limited: false, retryAfter: 0 };
   }
 
   const now = Date.now();
   const windowStart = now - 60 * 1000;
 
-  const recent = usage[sessionId].requestTimestamps.filter(
-    timestamp => timestamp >= windowStart
+  const recent = metrics.requestTimestamps.filter(
+    timestamp => timestamp > windowStart
   );
-  usage[sessionId].requestTimestamps = recent;
+  metrics.requestTimestamps = recent;
 
   if (recent.length < maxRequestsPerMinute) {
     return { limited: false, retryAfter: 0 };
@@ -159,16 +191,10 @@ export function checkRateLimit(
  * @param sessionId Unique identifier for the session
  */
 export function resetUsage(sessionId: string): void {
-  if (usage[sessionId]) {
-    usage[sessionId] = {
-      requestCount: 0,
-      tokenCount: 0,
-      lastRequestTime: Date.now(),
-      startTime: Date.now(),
-      tokenTimestamps: [],
-      requestTimestamps: []
-    };
-    logger.info(`Reset usage metrics for session: ${sessionId.substring(0, 8)}...`);
+  if (usage.has(sessionId)) {
+    usage.delete(sessionId);
+    initializeUsage(sessionId);
+    logger.info('Reset usage metrics for session');
   }
 }
 
@@ -182,9 +208,10 @@ export function getUsageSummary(): {
   activeSessions: number;
   averageTokensPerRequest: number;
 } {
-  const sessions = Object.keys(usage);
-  const totalRequests = sessions.reduce((sum, key) => sum + usage[key].requestCount, 0);
-  const totalTokens = sessions.reduce((sum, key) => sum + usage[key].tokenCount, 0);
+  pruneSessions();
+  const sessions = [...usage.values()];
+  const totalRequests = sessions.reduce((sum, metrics) => sum + metrics.requestCount, 0);
+  const totalTokens = sessions.reduce((sum, metrics) => sum + metrics.tokenCount, 0);
   
   return {
     totalRequests,

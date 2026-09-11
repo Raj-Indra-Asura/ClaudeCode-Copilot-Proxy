@@ -1,10 +1,10 @@
 import express from 'express';
-import { fetchEventSource } from '@microsoft/fetch-event-source';
+import { StringDecoder } from 'node:string_decoder';
+import { Readable } from 'node:stream';
 import { v4 as uuidv4 } from 'uuid';
 import { 
-  isTokenValid, 
+  ensureCopilotToken,
   getCopilotToken,
-  refreshCopilotToken 
 } from '../services/auth-service.js';
 import { 
   convertMessagesToCopilotPrompt,
@@ -16,27 +16,19 @@ import { AppError } from '../middleware/error-handler.js';
 import { config } from '../config/index.js';
 import { getMachineId } from '../utils/machine-id.js';
 import { logger } from '../utils/logger.js';
-import { trackRequest } from '../services/usage-service.js';
+import { trackRequest, trackTokens } from '../services/usage-service.js';
+import { upstreamFetch } from '../utils/upstream-fetch.js';
+import { abortOnDisconnect, writeResponse } from '../utils/response-stream.js';
 
 export const openaiRoutes = express.Router();
 
 // Authentication middleware
 const requireAuth = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  if (!isTokenValid()) {
-    const error = new Error('Authentication required') as AppError;
-    error.status = 401;
-    error.code = 'authentication_required';
-    return next(error);
-  }
-
   try {
-    // Check if token needs refreshing
-    if (getCopilotToken() && !isTokenValid()) {
-      await refreshCopilotToken();
-    }
+    await ensureCopilotToken();
     next();
   } catch (error) {
-    logger.error('Token refresh failed in middleware:', error);
+    logger.error('Token refresh failed in middleware');
     const authError = new Error('Authentication failed') as AppError;
     authError.status = 401;
     authError.code = 'authentication_failed';
@@ -75,8 +67,8 @@ openaiRoutes.get('/models', requireAuth, (req, res) => {
 // POST /v1/chat/completions - Create a completion
 openaiRoutes.post('/chat/completions', requireAuth, async (req, res, next) => {
   // Track this request
-  const sessionId = res.locals.sessionId;
-  trackRequest(sessionId, 0); // Initial tracking, token count will be updated later
+  const sessionId = res.locals.sessionId || uuidv4();
+  const { signal, cleanup } = abortOnDisconnect(res);
   try {
     const request = req.body as OpenAICompletionRequest;
     const { messages, stream = false, model = 'gpt-4' } = request;
@@ -96,14 +88,15 @@ openaiRoutes.post('/chat/completions', requireAuth, async (req, res, next) => {
       error.code = 'authentication_required';
       return next(error);
     }
+    trackRequest(sessionId);
     
     // Handle streaming response
     if (stream) {
-      handleStreamingCompletion(req, res, next, sessionId);
+      await handleStreamingCompletion(req, res, next, sessionId, signal);
     } else {
       // Handle non-streaming response
       try {
-        const completionData = await makeCompletionRequest(request, copilotToken.token);
+        const completionData = await makeCompletionRequest(request, copilotToken.token, signal);
         
         // Convert to OpenAI format
         const openAIResponse: OpenAICompletion = {
@@ -124,16 +117,24 @@ openaiRoutes.post('/chat/completions', requireAuth, async (req, res, next) => {
         
         // Track token usage
         const totalTokens = openAIResponse.usage?.total_tokens || 0;
-        trackRequest(sessionId, totalTokens);
+        trackTokens(sessionId, totalTokens);
         
-        res.json(openAIResponse);
+        if (!signal.aborted && !res.destroyed) {
+          res.json(openAIResponse);
+        }
       } catch (error) {
-        logger.error('Error in non-streaming completion:', error);
-        next(error);
+        logger.error('Error in non-streaming completion');
+        if (!signal.aborted && !res.destroyed) {
+          next(error);
+        }
       }
     }
   } catch (error) {
-    next(error);
+    if (!signal.aborted && !res.destroyed) {
+      next(error);
+    }
+  } finally {
+    cleanup();
   }
 });
 
@@ -142,8 +143,11 @@ async function handleStreamingCompletion(
   req: express.Request, 
   res: express.Response, 
   next: express.NextFunction,
-  sessionId: string
+  sessionId: string,
+  signal: AbortSignal
 ) {
+  let body: Readable | null = null;
+  let responseCharacters = 0;
   try {
     const request = req.body as OpenAICompletionRequest;
     const { messages, temperature, max_tokens, top_p, n, model = 'gpt-4' } = request;
@@ -163,15 +167,9 @@ async function handleStreamingCompletion(
     // Get machine ID for request
     const machineId = getMachineId();
     
-    // Set appropriate headers for SSE
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    
     const completionsUrl = config.github.copilot.apiEndpoints.GITHUB_COPILOT_COMPLETIONS;
     
-    // Set up event source for streaming
-    await fetchEventSource(completionsUrl, {
+    const upstream = await upstreamFetch(completionsUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -188,8 +186,8 @@ async function handleStreamingCompletion(
         prompt,
         suffix,
         max_tokens: max_tokens || 500,
-        temperature: temperature || 0.7,
-        top_p: top_p || 1,
+        temperature: temperature ?? 0.7,
+        top_p: top_p ?? 1,
         n: n || 1,
         stream: true,
         stop: ["\n\n"],
@@ -199,78 +197,85 @@ async function handleStreamingCompletion(
           trim_by_indentation: true,
         }
       }),
-      async onopen(response) {
-        if (!response.ok) {
-          logger.error('Stream connection error', {
-            status: response.status,
-            statusText: response.statusText
-          });
-          throw new Error(`Stream connection error: ${response.status} ${response.statusText}`);
+      signal,
+    });
+    body = upstream.body as Readable | null;
+    if (!upstream.ok || !body) {
+      throw new Error(`Stream connection error: ${upstream.status}`);
+    }
+    if (signal.aborted || res.destroyed) {
+      return;
+    }
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    const id = `chatcmpl-${uuidv4()}`;
+    const created = Math.floor(Date.now() / 1000);
+    const decoder = new StringDecoder('utf8');
+    let pending = '';
+    for await (const chunk of body) {
+      if (signal.aborted || res.destroyed) {
+        return;
+      }
+      pending += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      if (pending.length > 1024 * 1024) {
+        throw new Error('Upstream stream event too large');
+      }
+      let boundary: RegExpExecArray | null;
+      while ((boundary = /\r?\n\r?\n/.exec(pending))) {
+        const frame = pending.slice(0, boundary.index);
+        pending = pending.slice(boundary.index + boundary[0].length);
+        const dataText = frame.split(/\r?\n/)
+          .filter(line => line.startsWith('data:'))
+          .map(line => line.slice(5).replace(/^ /, ''))
+          .join('\n');
+        if (!dataText) {
+          continue;
         }
-      },
-      onmessage(msg) {
-        if (msg.data === '[DONE]') {
-          res.write('data: [DONE]\n\n');
+        if (dataText === '[DONE]') {
+          if (await writeResponse(res, 'data: [DONE]\n\n')) {
+            res.end();
+          }
           return;
         }
-        
-        try {
-          // Parse the data
-          const data = JSON.parse(msg.data);
-          
-          // Convert to ChatCompletions format
-          const openAiFormatted = {
-            id: `chatcmpl-${uuidv4()}`,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model,
-            choices: [
-              {
-                index: 0,
-                delta: {
-                  content: data.choices[0].text
-                },
-                finish_reason: data.choices[0].finish_reason || null
-              }
-            ]
+        const data = JSON.parse(dataText) as {
+          choices?: Array<{ index?: number; text?: string; finish_reason?: string | null }>;
+        };
+        if (!Array.isArray(data.choices)) {
+          throw new Error('Invalid upstream stream event');
+        }
+        const choices = data.choices.map((choice, index) => {
+          const text = choice.text ?? '';
+          responseCharacters += text.length;
+          return {
+            index: choice.index ?? index,
+            delta: { content: text },
+            finish_reason: choice.finish_reason ?? null,
           };
-          
-          res.write(`data: ${JSON.stringify(openAiFormatted)}\n\n`);
-        
-        // Note: For streaming, we don't have accurate token counts
-        // We'll estimate based on response length
-        if (data.choices[0].text) {
-          const estimatedTokens = Math.ceil(data.choices[0].text.length / 4);
-          trackRequest(sessionId, estimatedTokens);
+        });
+        if (!await writeResponse(res, `data: ${JSON.stringify({
+          id, object: 'chat.completion.chunk', created, model, choices,
+        })}\n\n`)) {
+          return;
         }
-        } catch (error) {
-          logger.error('Error parsing stream message:', error);
-          res.write(`data: ${JSON.stringify({ error: String(error) })}\n\n`);
-        }
-      },
-      onerror(err) {
-        logger.error('SSE stream error:', err);
-        res.write(`data: ${JSON.stringify({ error: String(err) })}\n\n`);
-        res.end();
-      },
-      onclose() {
-        res.end();
       }
-    });
+    }
+    throw new Error('Upstream stream ended before completion');
   } catch (error) {
-    logger.error('Error in streaming completion:', error);
-    
-    // Try to send error to client if response headers haven't been sent
+    if (signal.aborted || res.destroyed) {
+      return;
+    }
+    logger.error('Error in streaming completion');
     if (!res.headersSent) {
       return next(error);
     }
-    
-    // Otherwise try to write error to stream
-    try {
-      res.write(`data: ${JSON.stringify({ error: String(error) })}\n\n`);
+    if (await writeResponse(res, 'data: {"error":"Upstream streaming failed"}\n\n')) {
       res.end();
-    } catch (streamError) {
-      logger.error('Error sending error response to stream:', streamError);
     }
+  } finally {
+    body?.destroy();
+    trackTokens(sessionId, Math.ceil(responseCharacters / 4));
   }
 }

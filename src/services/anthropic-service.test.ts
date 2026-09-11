@@ -20,7 +20,9 @@ import {
   requestHasImages,
   sanitizeToolName,
 } from './anthropic-service.js';
-import { AnthropicMessage, AnthropicMessageRequest, AnthropicTool } from '../types/anthropic.js';
+import {
+  AnthropicMessage, AnthropicMessageRequest, AnthropicStreamEvent, AnthropicTool,
+} from '../types/anthropic.js';
 import { CopilotChatStreamChunk } from '../types/copilot-chat.js';
 
 describe('Anthropic Service', () => {
@@ -206,8 +208,34 @@ describe('Anthropic Service', () => {
     ];
 
     it('sanitizes names that the upstream API rejects', () => {
-      expect(sanitizeToolName('mcp__github__list:issues')).toBe('mcp__github__list_issues');
+      expect(sanitizeToolName('mcp__github__list:issues')).toMatch(/^[a-zA-Z0-9_-]{1,64}$/);
       expect(sanitizeToolName('a'.repeat(100))).toHaveLength(64);
+      expect(sanitizeToolName('Read')).toBe('Read');
+    });
+
+    it('avoids replacement, truncation and reserved-namespace collisions deterministically', () => {
+      const names = ['a:b', 'a?b', 'a_b', 'a'.repeat(100), 'a'.repeat(99) + 'b', ''];
+      names.push(sanitizeToolName('a:b'));
+      const sanitized = names.map(sanitizeToolName);
+      expect(new Set(sanitized).size).toBe(names.length);
+      expect(names.map(sanitizeToolName)).toEqual(sanitized);
+      for (const name of sanitized) {
+        expect(name).toMatch(/^[a-zA-Z0-9_-]{1,64}$/);
+      }
+    });
+
+    it('uses the same names in definitions, history and tool_choice and restores history names', () => {
+      const name = 'mcp:Read';
+      const messages: AnthropicMessage[] = [{
+        role: 'assistant', content: [{ type: 'tool_use', id: 'c1', name, input: {} }],
+      }];
+      const toolChoice = { type: 'tool' as const, name };
+      const expected = sanitizeToolName(name);
+      expect(convertAnthropicMessagesToCopilot(messages)[0].tool_calls?.[0].function.name)
+        .toBe(expected);
+      expect(convertAnthropicToolChoiceToCopilot(toolChoice))
+        .toEqual({ type: 'function', function: { name: expected } });
+      expect(buildToolNameMap(undefined, messages, toolChoice).get(expected)).toBe(name);
     });
 
     it('converts tools into OpenAI function tools', () => {
@@ -215,7 +243,7 @@ describe('Anthropic Service', () => {
         {
           type: 'function',
           function: {
-            name: 'mcp__github__list_issues',
+            name: sanitizeToolName(tools[0].name),
             description: 'List issues',
             parameters: { type: 'object', properties: { repo: { type: 'string' } } },
           },
@@ -225,7 +253,7 @@ describe('Anthropic Service', () => {
     });
 
     it('maps sanitized names back to the original names', () => {
-      expect(buildToolNameMap(tools).get('mcp__github__list_issues')).toBe(
+      expect(buildToolNameMap(tools).get(sanitizeToolName(tools[0].name))).toBe(
         'mcp__github__list:issues'
       );
     });
@@ -244,7 +272,7 @@ describe('Anthropic Service', () => {
 
   describe('buildCopilotChatRequest', () => {
     const base: AnthropicMessageRequest = {
-      model: 'claude-sonnet-4-5-20250929',
+      model: 'sonnet',
       messages: [{ role: 'user', content: 'hi' }],
       max_tokens: 1024,
     };
@@ -293,6 +321,15 @@ describe('Anthropic Service', () => {
     it('clamps max_tokens to the configured ceiling', () => {
       const body = buildCopilotChatRequest({ ...base, max_tokens: 10_000_000 }, { stream: false });
       expect(body.max_tokens).toBe(64000);
+    });
+
+    it.each([true, false])('maps disable_parallel_tool_use=%s', (disabled) => {
+      const body = buildCopilotChatRequest({
+        ...base,
+        tools: [{ name: 'Read', input_schema: { type: 'object' } }],
+        tool_choice: { type: 'auto', disable_parallel_tool_use: disabled },
+      }, { stream: true });
+      expect(body.parallel_tool_calls).toBe(!disabled);
     });
   });
 
@@ -397,6 +434,35 @@ describe('Anthropic Service', () => {
       expect(result.content).toEqual([{ type: 'text', text: '' }]);
     });
 
+    it('reports the actual provider model instead of the requested alias or family', () => {
+      const result = convertCopilotToAnthropicResponse({
+        model: 'gpt-upstream',
+        choices: [{ message: { content: 'hello' }, finish_reason: 'stop' }],
+      }, 'claude-request-alias');
+      expect(result.model).toBe('gpt-upstream');
+    });
+
+    it('uses the resolved request model when upstream omits model metadata', () => {
+      expect(convertCopilotToAnthropicResponse({ choices: [] }, 'resolved-copilot-model').model)
+        .toBe('resolved-copilot-model');
+    });
+
+    it.each(['{"incomplete":', '[]', '', 'null'])('rejects invalid buffered tool input %s', (raw) => {
+      expect(() => convertCopilotToAnthropicResponse({
+        choices: [{ message: { tool_calls: [{
+          id: 'call_1', type: 'function', function: { name: 'Read', arguments: raw },
+        }] }, finish_reason: 'length' }],
+      }, 'claude-sonnet-5')).toThrow('tool arguments');
+    });
+
+    it('rejects buffered tool calls without an upstream ID', () => {
+      expect(() => convertCopilotToAnthropicResponse({
+        choices: [{ message: { tool_calls: [{
+          id: '', type: 'function', function: { name: 'Read', arguments: '{}' },
+        }] } }],
+      }, 'claude-sonnet-5')).toThrow('incomplete tool call');
+    });
+
     it('truncates at a stop sequence, which Copilot ignores upstream', () => {
       const result = convertCopilotToAnthropicResponse(
         {
@@ -445,12 +511,12 @@ describe('Anthropic Service', () => {
   });
 
   describe('parseToolArguments', () => {
-    it('parses JSON objects and degrades gracefully', () => {
+    it('parses JSON objects without inventing fallback arguments', () => {
       expect(parseToolArguments('{"a":1}')).toEqual({ a: 1 });
-      expect(parseToolArguments('')).toEqual({});
-      expect(parseToolArguments(undefined)).toEqual({});
-      expect(parseToolArguments('not json')).toEqual({ __raw: 'not json' });
-      expect(parseToolArguments('[1,2]')).toEqual({ value: [1, 2] });
+      expect(parseToolArguments('{}')).toEqual({});
+      for (const raw of ['', undefined, 'not json', '[1,2]', 'null', '1', '{"x":']) {
+        expect(() => parseToolArguments(raw)).toThrow('invalid or incomplete tool arguments');
+      }
     });
   });
 
@@ -481,19 +547,21 @@ describe('Anthropic Service', () => {
   });
 
   describe('parseCopilotSseStream', () => {
-    async function collect(raw: string): Promise<CopilotChatStreamChunk[]> {
+    async function collect(raw: string | (string | Buffer)[]): Promise<CopilotChatStreamChunk[]> {
       const chunks: CopilotChatStreamChunk[] = [];
-      for await (const chunk of parseCopilotSseStream(Readable.from([raw]))) {
+      for await (const chunk of parseCopilotSseStream(Readable.from(
+        typeof raw === 'string' ? [raw] : raw
+      ))) {
         chunks.push(chunk);
       }
       return chunks;
     }
 
-    it('parses data frames and ignores [DONE]', async () => {
+    it('parses data frames and terminates at [DONE]', async () => {
       const raw =
         'data: {"choices":[{"delta":{"content":"a"}}]}\n\n' +
         'data: {"choices":[{"delta":{"content":"b"}}]}\n\n' +
-        'data: [DONE]\n\n';
+        'data: [DONE]\n\ndata: {"choices":[{"delta":{"content":"ignored"}}]}\n\n';
 
       const chunks = await collect(raw);
 
@@ -516,9 +584,49 @@ describe('Anthropic Service', () => {
       expect(chunks[0].choices?.[0].delta?.content).toBe('split');
     });
 
-    it('skips unparsable payloads instead of throwing', async () => {
-      const chunks = await collect('data: {oops\n\ndata: {"id":"1"}\n\n');
-      expect(chunks).toEqual([{ id: '1' }]);
+    it('preserves UTF-8 when every byte arrives in a separate network chunk', async () => {
+      const raw = Buffer.from('data: {"choices":[{"delta":{"content":"你好👋"}}]}\n\n' +
+        'data: [DONE]\n\n');
+      const chunks = await collect([...raw].map((byte) => Buffer.from([byte])));
+      expect(chunks[0].choices?.[0].delta?.content).toBe('你好👋');
+    });
+
+    it('joins multiline data and accepts comments and bare-CR line endings', async () => {
+      const chunks = await collect(': heartbeat\rdata: {"choices":\r' +
+        'data: [{"delta":{"content":"hello"}}]}\r\rdata: [DONE]\r\r');
+      expect(chunks[0].choices?.[0].delta?.content).toBe('hello');
+    });
+
+    it.each([
+      'data: {oops\n\ndata: [DONE]\n\n',
+      'data: {"choices":[]}',
+      'data: {"choices":[]}\n\n',
+      'data: {"error":{"message":"private upstream detail"}}\n\n',
+      'event: error\ndata: {"message":"private upstream detail"}\n\n',
+      'data: null\n\n',
+    ])('rejects malformed, errored or truncated SSE without exposing its body', async (raw) => {
+      await expect(collect(raw)).rejects.toThrow('Copilot');
+      await expect(collect(raw)).rejects.not.toThrow('private upstream detail');
+    });
+
+    it('rejects invalid and truncated UTF-8', async () => {
+      await expect(collect([Buffer.from([0xff])])).rejects.toThrow('invalid UTF-8');
+      await expect(collect([Buffer.from([0xf0, 0x9f])])).rejects.toThrow('incomplete UTF-8');
+    });
+
+    it('bounds unterminated events', async () => {
+      await expect(collect('data: ' + 'x'.repeat(1024 * 1024))).rejects.toThrow('buffer limit');
+    });
+
+    it('destroys the readable after [DONE] or downstream cancellation', async () => {
+      const body = Readable.from(['data: {"id":"1"}\n\ndata: [DONE]\n\n']);
+      const parser = parseCopilotSseStream(body);
+      expect((await parser.next()).value).toEqual({ id: '1' });
+      await parser.return(undefined);
+      expect(body.destroyed).toBe(true);
+      const doneBody = Readable.from(['data: [DONE]\n\n']);
+      expect((await parseCopilotSseStream(doneBody).next()).done).toBe(true);
+      expect(doneBody.destroyed).toBe(true);
     });
   });
 
@@ -530,14 +638,31 @@ describe('Anthropic Service', () => {
     }
 
     async function collectEvents(chunks: CopilotChatStreamChunk[], toolNameMap?: Map<string, string>) {
-      const events = [];
+      const events: AnthropicStreamEvent[] = [];
       for await (const event of convertCopilotStreamToAnthropicEvents(source(chunks), {
         messageId: 'msg_test',
-        model: 'claude-sonnet-4-5',
+        model: 'claude-sonnet-5',
         toolNameMap,
       })) {
         events.push(event);
       }
+      let openBlock: number | null = null;
+      let nextIndex = 0;
+      for (const event of events) {
+        if (event.type === 'content_block_start') {
+          expect(openBlock).toBeNull();
+          expect(event.index).toBe(nextIndex++);
+          openBlock = event.index;
+        } else if (event.type === 'content_block_delta') {
+          expect(event.index).toBe(openBlock);
+        } else if (event.type === 'content_block_stop') {
+          expect(event.index).toBe(openBlock);
+          openBlock = null;
+        }
+      }
+      expect(openBlock).toBeNull();
+      expect(events[0].type).toBe('message_start');
+      expect(events.at(-1)?.type).toBe('message_stop');
       return events;
     }
 
@@ -659,7 +784,6 @@ describe('Anthropic Service', () => {
         'content_block_stop',
         'content_block_start',
         'content_block_delta',
-        'content_block_delta',
         'content_block_stop',
         'message_delta',
         'message_stop',
@@ -709,6 +833,184 @@ describe('Anthropic Service', () => {
       );
       expect(messageDelta?.delta.stop_reason).toBe('max_tokens');
     });
+
+    it('merges every choice and serializes interleaved tools with choice-scoped indices', async () => {
+      const events = await collectEvents([
+        { choices: [{ index: 0, delta: { content: 'before' }, finish_reason: 'stop' }] },
+        { choices: [
+          { index: 1, delta: { tool_calls: [
+            { index: 0, id: 'call_', function: { name: 'Re', arguments: '{"a":' } },
+          ] } },
+          { index: 2, delta: { tool_calls: [
+            { index: 0, id: 'call_b', function: { name: 'Other', arguments: '{"b":2}' } },
+          ] }, finish_reason: 'tool_calls' },
+        ] },
+        { choices: [{ index: 3, delta: { content: 'between' }, finish_reason: 'stop' }] },
+        { choices: [{ index: 1, delta: { tool_calls: [
+          { index: 1, id: 'call_c', function: { name: 'Third', arguments: '{}' } },
+          { index: 0, id: 'a', function: { name: 'ad', arguments: '1}' } },
+        ] }, finish_reason: 'tool_calls' }] },
+        { choices: [{ index: 4, delta: { content: 'after' }, finish_reason: 'stop' }] },
+      ]);
+      const starts = events.filter((event) => event.type === 'content_block_start');
+      expect(starts.map((event) => event.content_block.type)).toEqual([
+        'text', 'tool_use', 'tool_use', 'text', 'tool_use', 'text',
+      ]);
+      expect(starts.filter((event) => event.content_block.type === 'tool_use')
+        .map((event) => event.content_block)).toEqual([
+        { type: 'tool_use', id: 'call_a', name: 'Read', input: {} },
+        { type: 'tool_use', id: 'call_b', name: 'Other', input: {} },
+        { type: 'tool_use', id: 'call_c', name: 'Third', input: {} },
+      ]);
+      expect(events.filter((event) => event.type === 'content_block_delta')
+        .map((event) => 'text' in event.delta ? event.delta.text : event.delta.partial_json))
+        .toEqual(['before', '{"a":1}', '{"b":2}', 'between', '{}', 'after']);
+    });
+
+    it('emits text without reading ahead and closes upstream when the consumer stops', async () => {
+      let reads = 0;
+      let closed = false;
+      async function* incrementalSource(): AsyncGenerator<CopilotChatStreamChunk> {
+        try {
+          reads++;
+          yield { choices: [{ delta: { content: 'first' } }] };
+          reads++;
+          yield { choices: [{ delta: { content: 'second' }, finish_reason: 'stop' }] };
+        } finally {
+          closed = true;
+        }
+      }
+      const events = convertCopilotStreamToAnthropicEvents(incrementalSource(), {
+        messageId: 'msg_test', model: 'claude-sonnet-5',
+      });
+      expect((await events.next()).value?.type).toBe('message_start');
+      expect((await events.next()).value?.type).toBe('content_block_start');
+      expect((await events.next()).value).toMatchObject({
+        type: 'content_block_delta', delta: { text: 'first' },
+      });
+      expect(reads).toBe(1);
+      await events.return(undefined);
+      expect(closed).toBe(true);
+    });
+
+    it('closes the upstream iterator immediately on a local stop', async () => {
+      let closed = false;
+      let readAfterStop = false;
+      async function* stoppedSource(): AsyncGenerator<CopilotChatStreamChunk> {
+        try {
+          yield { choices: [{ delta: { content: 'ok STOP never' } }] };
+          readAfterStop = true;
+          yield { choices: [{ finish_reason: 'stop' }] };
+        } finally {
+          closed = true;
+        }
+      }
+      const events: AnthropicStreamEvent[] = [];
+      for await (const event of convertCopilotStreamToAnthropicEvents(stoppedSource(), {
+        messageId: 'msg_test', model: 'claude-sonnet-5', stopSequences: ['STOP'],
+      })) {
+        events.push(event);
+      }
+      expect(readAfterStop).toBe(false);
+      expect(closed).toBe(true);
+      expect(events.at(-1)?.type).toBe('message_stop');
+    });
+
+    it('preserves withheld text before a tool block', async () => {
+      const events: AnthropicStreamEvent[] = [];
+      for await (const event of convertCopilotStreamToAnthropicEvents(source([
+        { choices: [{ delta: { content: 'keep ST' } }] },
+        { choices: [{ delta: { tool_calls: [
+          { index: 0, id: 'call_1', function: { name: 'Read', arguments: '{}' } },
+        ] }, finish_reason: 'tool_calls' }] },
+      ]), { messageId: 'msg_test', model: 'claude-sonnet-5', stopSequences: ['STOP'] })) {
+        events.push(event);
+      }
+      expect(events.filter((event) => event.type === 'content_block_delta')
+        .map((event) => 'text' in event.delta ? event.delta.text : '').join('')).toBe('keep ST');
+    });
+
+    it.each(['', '{"x":', '[1]', 'null'])('rejects malformed/truncated streamed arguments %s', async (raw) => {
+      await expect(collectEvents([
+        { choices: [{ delta: { tool_calls: [
+          { index: 0, id: 'call_1', function: { name: 'Read', arguments: raw } },
+        ] }, finish_reason: 'length' }] },
+      ])).rejects.toThrow('tool arguments');
+    });
+
+    it('rejects missing tool metadata, duplicate IDs, and unfinished choices', async () => {
+      await expect(collectEvents([
+        { choices: [{ delta: { tool_calls: [
+          { index: 0, function: { arguments: '{}' } },
+        ] }, finish_reason: 'tool_calls' }] },
+      ])).rejects.toThrow('tool metadata');
+      await expect(collectEvents([
+        { choices: [{ delta: { tool_calls: [
+          { index: 0, id: 'same', function: { name: 'Read', arguments: '{}' } },
+          { index: 1, id: 'same', function: { name: 'Read', arguments: '{}' } },
+        ] }, finish_reason: 'tool_calls' }] },
+      ])).rejects.toThrow('duplicate tool metadata');
+      await expect(collectEvents([{ choices: [{ delta: { content: 'cut off' } }] }]))
+        .rejects.toThrow('incomplete choice');
+      await expect(collectEvents([
+        { choices: [{ index: 1, delta: { tool_calls: [
+          { index: 0, id: 'c1', function: { name: 'Read', arguments: '{}' } },
+        ] } }] },
+        { choices: [{ index: 0, finish_reason: 'stop' }] },
+      ])).rejects.toThrow('incomplete choice');
+    });
+
+    it('bounds argument and deferred-text buffering', async () => {
+      const tool: CopilotChatStreamChunk = { choices: [{ delta: { tool_calls: [
+        { index: 0, id: 'c1', function: { name: 'Read', arguments: '{' } },
+      ] } }] };
+      await expect(collectEvents([tool, { choices: [{ delta: { tool_calls: [
+        { index: 0, function: { arguments: 'x'.repeat(4 * 1024 * 1024) } },
+      ] } }] }])).rejects.toThrow('buffer limit');
+      await expect(collectEvents([tool,
+        ...Array.from({ length: 5 }, () => ({
+          choices: [{ delta: { content: 'x'.repeat(1024 * 1024) } }],
+        })),
+      ])).rejects.toThrow('buffer limit');
+    });
+
+    it('reports the upstream model and otherwise the mapped request model', async () => {
+      const upstream = await collectEvents([
+        { model: 'gpt-actual', choices: [{ delta: { content: 'hi' }, finish_reason: 'stop' }] },
+      ]);
+      expect(upstream[0]).toMatchObject({ message: { model: 'gpt-actual' } });
+      const fallback = await collectEvents([{ choices: [{ finish_reason: 'stop' }] }]);
+      expect(fallback[0]).toMatchObject({ message: { model: 'claude-sonnet-5' } });
+    });
+
+    it('never adds estimates to authoritative usage, even when it arrives before later text', async () => {
+      const events = await collectEvents([
+        { choices: [{ delta: { content: 'abc' } }],
+          usage: { prompt_tokens: 13, completion_tokens: 0 } },
+        { choices: [{ delta: { content: 'def' }, finish_reason: 'stop' }] },
+      ]);
+      expect(events.find((event) => event.type === 'message_delta')?.usage)
+        .toEqual({ input_tokens: 13, output_tokens: 0 });
+    });
+
+    it('estimates output independently of chunk boundaries and preserves trailing usage', async () => {
+      const text = 'const x = "你好👋";';
+      const whole = await collectEvents([
+        { choices: [{ delta: { content: text }, finish_reason: 'stop' }] },
+      ]);
+      const fragmented = await collectEvents([
+        ...text.split('').map((content) => ({ choices: [{ delta: { content } }] })),
+        { choices: [{ finish_reason: 'stop' }] },
+      ]);
+      expect(whole.find((event) => event.type === 'message_delta')?.usage)
+        .toEqual(fragmented.find((event) => event.type === 'message_delta')?.usage);
+      const authoritative = await collectEvents([
+        { choices: [{ delta: { content: text }, finish_reason: 'stop' }] },
+        { choices: [], usage: { prompt_tokens: 14, completion_tokens: 8 } },
+      ]);
+      expect(authoritative.find((event) => event.type === 'message_delta')?.usage)
+        .toEqual({ input_tokens: 14, output_tokens: 8 });
+    });
   });
 
   describe('estimateInputTokens', () => {
@@ -738,6 +1040,15 @@ describe('Anthropic Service', () => {
         [{ name: 'Read', description: 'd', input_schema: { type: 'object', properties: {} } }]
       );
       expect(withTools).toBeGreaterThan(100);
+    });
+
+    it('uses conservative Unicode and code heuristics instead of characters divided by four', () => {
+      const unicode = '你好👋'.repeat(100);
+      const code = '{}[]();=><'.repeat(100);
+      expect(estimateInputTokens([{ role: 'user', content: unicode }]))
+        .toBeGreaterThanOrEqual(Buffer.byteLength(unicode));
+      expect(estimateInputTokens([{ role: 'user', content: code }]))
+        .toBeGreaterThanOrEqual(code.length);
     });
   });
 });

@@ -53,7 +53,7 @@ export function rateLimiter(options: RateLimiterOptions | number = {}) {
     // Determine rate limit based on route
     const route = req.path;
     const routeLimit = ROUTE_RATE_LIMITS[route];
-    const effectiveLimit = maxRequestsPerMinute || routeLimit || config.rateLimits.default;
+    const effectiveLimit = maxRequestsPerMinute ?? routeLimit ?? config.rateLimits.default;
 
     // Get session identifier - use token hash if available, or IP address
     const token = res.locals.token || '';
@@ -90,7 +90,7 @@ export function rateLimiter(options: RateLimiterOptions | number = {}) {
         // Get token usage for the past minute
         const tokensPastMinute = getTokenUsageInWindow(sessionId, 60 * 1000);
         
-        if (tokensPastMinute > config.rateLimits.maxTokensPerMinute) {
+        if (tokensPastMinute >= config.rateLimits.maxTokensPerMinute) {
           logger.warn(`Token rate limit exceeded for session: ${sessionId.substring(0, 8)}...`);
           
           // Calculate when they can try again based on token usage

@@ -8,11 +8,12 @@
 // ============================================================================
 
 /**
- * Prompt-caching marker. Accepted (and ignored) for API compatibility:
- * GitHub Copilot manages caching server-side.
+ * Prompt-caching marker. Warned about or rejected by the compatibility policy;
+ * Copilot chat completions has no verified equivalent cache-boundary semantics.
  */
 export interface CacheControl {
   type: 'ephemeral';
+  ttl?: '5m' | '1h';
 }
 
 /**
@@ -137,7 +138,7 @@ export type AnthropicToolChoice =
  * Extended thinking configuration
  */
 export interface AnthropicThinkingConfig {
-  type: 'enabled' | 'disabled';
+  type: 'enabled' | 'disabled' | 'adaptive';
   budget_tokens?: number;
 }
 
@@ -184,6 +185,10 @@ export interface AnthropicMessageRequest {
   
   /** Extended thinking configuration (accepted, not forwarded to Copilot) */
   thinking?: AnthropicThinkingConfig;
+
+  /** Automatic caching and output configuration have no verified chat equivalent. */
+  cache_control?: CacheControl;
+  output_config?: Record<string, unknown>;
   
   /** Metadata for the request */
   metadata?: {

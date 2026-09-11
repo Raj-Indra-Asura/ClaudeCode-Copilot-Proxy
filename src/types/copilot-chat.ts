@@ -80,6 +80,7 @@ export interface CopilotChatRequest {
   stream?: boolean;
   tools?: CopilotTool[];
   tool_choice?: CopilotToolChoice;
+  parallel_tool_calls?: boolean;
 }
 
 export interface CopilotChatUsage {
@@ -99,6 +100,7 @@ export interface CopilotChatChoice {
 }
 
 export interface CopilotChatResponse {
+  error?: unknown;
   id?: string;
   object?: string;
   created?: number;
@@ -118,6 +120,7 @@ export interface CopilotChatStreamChoice {
 }
 
 export interface CopilotChatStreamChunk {
+  error?: unknown;
   id?: string;
   object?: string;
   created?: number;

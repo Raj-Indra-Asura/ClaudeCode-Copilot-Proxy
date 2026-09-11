@@ -12,7 +12,7 @@
  * proxy keeps working offline or before authentication.
  */
 
-import fetch from 'node-fetch';
+import { destroyUpstreamBody, upstreamFetch } from '../utils/upstream-fetch.js';
 import { config } from '../config/index.js';
 import { getCopilotToken } from './auth-service.js';
 import { buildCopilotHeaders } from '../utils/copilot-headers.js';
@@ -165,22 +165,36 @@ export function getCatalogOutputLimit(id: string): number | undefined {
  * upstream error cannot empty Claude Code's model list.
  */
 export async function refreshModelCatalog(
-  options: { force?: boolean } = {}
+  options: { force?: boolean; signal?: AbortSignal } = {}
 ): Promise<CatalogModel[]> {
+  if (options.signal?.aborted) {
+    throw options.signal.reason;
+  }
   const isFresh = catalog.length > 0 && Date.now() - fetchedAt < CATALOG_TTL_MS;
   if (!options.force && isFresh) {
     return catalog;
   }
 
-  if (inFlight) {
-    return inFlight;
+  if (!inFlight) {
+    inFlight = fetchCatalog().finally(() => {
+      inFlight = null;
+    });
   }
 
-  inFlight = fetchCatalog().finally(() => {
-    inFlight = null;
+  if (!options.signal) {
+    return inFlight;
+  }
+  // Cancel only this waiter: other requests may be sharing the catalog fetch.
+  const signal = options.signal;
+  const pending = inFlight;
+  return new Promise<CatalogModel[]>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+    if (signal.aborted) {
+      onAbort();
+    }
   });
-
-  return inFlight;
 }
 
 async function fetchCatalog(): Promise<CatalogModel[]> {
@@ -192,7 +206,7 @@ async function fetchCatalog(): Promise<CatalogModel[]> {
   const url = resolveModelsEndpoint();
 
   try {
-    const response = await fetch(url, {
+    const response = await upstreamFetch(url, {
       method: 'GET',
       headers: buildCopilotHeaders(token, { stream: false, hasImages: false }),
     });
@@ -200,8 +214,8 @@ async function fetchCatalog(): Promise<CatalogModel[]> {
     if (!response.ok) {
       logger.warn('Copilot model catalog request failed', {
         status: response.status,
-        statusText: response.statusText,
       });
+      destroyUpstreamBody(response);
       return catalog;
     }
 
@@ -237,11 +251,7 @@ async function fetchCatalog(): Promise<CatalogModel[]> {
 
     return catalog;
   } catch (error) {
-    logger.warn(
-      `Could not load Copilot model catalog: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    );
+    logger.warn('Could not load Copilot model catalog');
     return catalog;
   }
 }

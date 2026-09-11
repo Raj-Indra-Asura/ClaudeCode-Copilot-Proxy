@@ -8,7 +8,9 @@
  * features Claude Code depends on for day-to-day work.
  */
 
-import fetch, { Response } from 'node-fetch';
+import { Response } from 'node-fetch';
+import { createHash } from 'node:crypto';
+import { TextDecoder } from 'node:util';
 import { v4 as uuidv4 } from 'uuid';
 import { config } from '../config/index.js';
 import { getCopilotToken } from './auth-service.js';
@@ -41,9 +43,11 @@ import { mapClaudeModelToCopilot } from '../utils/model-mapper.js';
 import { getCatalogOutputLimit } from './model-catalog.js';
 import { buildCopilotHeaders } from '../utils/copilot-headers.js';
 import { logger } from '../utils/logger.js';
+import { upstreamFetch } from '../utils/upstream-fetch.js';
 
-/** Average characters per token, used for local estimates only. */
-const CHARS_PER_TOKEN = 4;
+const MAX_SSE_EVENT_BYTES = 1024 * 1024;
+const MAX_STREAM_BUFFER_BYTES = 4 * 1024 * 1024;
+const MAX_STREAM_BLOCKS = 1024;
 
 /** OpenAI-style tool names accept `[a-zA-Z0-9_-]{1,64}`. */
 const TOOL_NAME_PATTERN = /[^a-zA-Z0-9_-]/g;
@@ -200,21 +204,40 @@ export function flattenToolResultContent(content: string | ContentBlock[] | unde
  * Sanitize a tool name so it satisfies the upstream tool-name constraints.
  */
 export function sanitizeToolName(name: string): string {
+  // Reserve a namespace so a valid name cannot alias an encoded invalid name.
+  if (/^[a-zA-Z0-9_-]{1,64}$/.test(name) && !name.startsWith('__cc_')) {
+    return name;
+  }
   const sanitized = name.replace(TOOL_NAME_PATTERN, '_');
-  return sanitized.length > 64 ? sanitized.slice(0, 64) : sanitized;
+  const digest = createHash('sha256').update(name).digest('hex').slice(0, 24);
+  return `__cc_${sanitized.slice(0, 34)}_${digest}`;
 }
 
 /**
  * Build the sanitized-name -> original-name lookup used to restore Claude
  * Code's tool names on the way back.
  */
-export function buildToolNameMap(tools?: AnthropicTool[]): Map<string, string> {
+export function buildToolNameMap(
+  tools?: AnthropicTool[],
+  messages?: AnthropicMessage[],
+  toolChoice?: AnthropicToolChoice
+): Map<string, string> {
   const map = new Map<string, string>();
   for (const tool of tools ?? []) {
     if (!tool?.name) {
       continue;
     }
     map.set(sanitizeToolName(tool.name), tool.name);
+  }
+  for (const message of messages ?? []) {
+    for (const block of Array.isArray(message.content) ? message.content : []) {
+      if (block.type === 'tool_use') {
+        map.set(sanitizeToolName(block.name), block.name);
+      }
+    }
+  }
+  if (toolChoice?.type === 'tool') {
+    map.set(sanitizeToolName(toolChoice.name), toolChoice.name);
   }
   return map;
 }
@@ -457,6 +480,10 @@ export function buildCopilotChatRequest(
     if (toolChoice) {
       body.tool_choice = toolChoice;
     }
+    if (request.tool_choice && 'disable_parallel_tool_use' in request.tool_choice &&
+        typeof request.tool_choice.disable_parallel_tool_use === 'boolean') {
+      body.parallel_tool_calls = !request.tool_choice.disable_parallel_tool_use;
+    }
   }
 
   return body;
@@ -497,22 +524,18 @@ export function mapFinishReasonToStopReason(
 }
 
 /**
- * Safely parse a tool call argument string into an object.
+ * Reject incomplete or non-object arguments rather than inventing executable input.
  */
 export function parseToolArguments(raw: string | undefined): Record<string, unknown> {
-  if (!raw || raw.trim() === '') {
-    return {};
-  }
-
   try {
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : { value: parsed };
+    const parsed: unknown = JSON.parse(raw ?? '');
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
   } catch {
-    logger.warn('Failed to parse tool call arguments as JSON, forwarding as raw text');
-    return { __raw: raw };
+    // Do not include generated arguments in errors or logs.
   }
+  throw new CopilotApiError(502, 'Copilot returned invalid or incomplete tool arguments');
 }
 
 /**
@@ -581,7 +604,7 @@ export function pendingStopSequenceLength(text: string, stopSequences?: string[]
 }
 
 /**
- * Convert a Copilot chat completion response into an Anthropic message.
+ * Convert a Copilot completion, using the mapped request model only as fallback.
  */
 export function convertCopilotToAnthropicResponse(
   data: CopilotChatResponse,
@@ -618,10 +641,12 @@ export function convertCopilotToAnthropicResponse(
 
   for (const entry of choices) {
     for (const toolCall of entry?.message?.tool_calls ?? []) {
-      if (!toolCall?.function?.name) {
-        continue;
+      if (typeof toolCall?.id !== 'string' || !toolCall.id || toolCall.id.length > 512 ||
+          typeof toolCall?.function?.name !== 'string' ||
+          !/^[a-zA-Z0-9_-]{1,64}$/.test(toolCall.function.name)) {
+        throw new CopilotApiError(502, 'Copilot returned an incomplete tool call');
       }
-      const id = toolCall.id || `toolu_${uuidv4().replace(/-/g, '').slice(0, 24)}`;
+      const id = toolCall.id;
       if (seenToolIds.has(id)) {
         continue;
       }
@@ -655,7 +680,7 @@ export function convertCopilotToAnthropicResponse(
     type: 'message',
     role: 'assistant',
     content,
-    model,
+    model: data.model || model,
     stop_reason: stopSequenceHit
       ? 'stop_sequence'
       : mapFinishReasonToStopReason(choice?.finish_reason, hasToolUse),
@@ -695,7 +720,8 @@ export function resolveCopilotChatEndpoint(): string {
 async function postToCopilot(
   request: AnthropicMessageRequest,
   copilotToken: string,
-  stream: boolean
+  stream: boolean,
+  signal?: AbortSignal
 ): Promise<Response> {
   const body = buildCopilotChatRequest(request, { stream });
   const headers = buildCopilotHeaders(copilotToken, {
@@ -711,56 +737,29 @@ async function postToCopilot(
     stream,
   });
 
-  const response = await fetch(resolveCopilotChatEndpoint(), {
+  const response = await upstreamFetch(resolveCopilotChatEndpoint(), {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
+    signal,
   });
 
   if (!response.ok) {
-    const errorText = await response.text().catch(() => '');
+    destroyBody(response.body);
     logger.error('Copilot chat API error', {
       status: response.status,
-      statusText: response.statusText,
-      body: errorText.slice(0, 2000),
     });
     throw new CopilotApiError(
       response.status,
-      extractUpstreamErrorMessage(errorText) ||
-        `Copilot API error: ${response.status} ${response.statusText}`
+      `Copilot API request failed with status ${response.status}`
     );
   }
 
   return response;
 }
 
-/**
- * Pull a human-readable message out of an upstream error payload.
- */
-function extractUpstreamErrorMessage(body: string): string {
-  if (!body) {
-    return '';
-  }
-
-  try {
-    const parsed = JSON.parse(body) as {
-      error?: { message?: string } | string;
-      message?: string;
-    };
-    if (typeof parsed.error === 'string') {
-      return parsed.error;
-    }
-    if (parsed.error?.message) {
-      return parsed.error.message;
-    }
-    if (parsed.message) {
-      return parsed.message;
-    }
-  } catch {
-    // Fall through to the raw body.
-  }
-
-  return body.slice(0, 500);
+function destroyBody(body: NodeJS.ReadableStream | null): void {
+  (body as (NodeJS.ReadableStream & { destroy?: () => void }) | null)?.destroy?.();
 }
 
 /**
@@ -768,14 +767,26 @@ function extractUpstreamErrorMessage(body: string): string {
  */
 export async function makeAnthropicCompletionRequest(
   request: AnthropicMessageRequest,
-  copilotToken: string
+  copilotToken: string,
+  signal?: AbortSignal
 ): Promise<AnthropicMessageResponse> {
-  const response = await postToCopilot(request, copilotToken, false);
-  const data = (await response.json()) as CopilotChatResponse;
+  const mappedModel = mapClaudeModelToCopilot(request.model);
+  const response = await postToCopilot(request, copilotToken, false, signal);
+  let data: CopilotChatResponse;
+  try {
+    data = (await response.json()) as CopilotChatResponse;
+  } catch {
+    throw new CopilotApiError(502, 'Copilot returned an invalid or incomplete response');
+  } finally {
+    destroyBody(response.body);
+  }
+  if (!data || data.error || !Array.isArray(data.choices)) {
+    throw new CopilotApiError(502, 'Copilot returned an invalid completion');
+  }
   return convertCopilotToAnthropicResponse(
     data,
-    request.model,
-    buildToolNameMap(request.tools),
+    mappedModel,
+    buildToolNameMap(request.tools, request.messages, request.tool_choice),
     request.stop_sequences
   );
 }
@@ -786,35 +797,89 @@ export async function makeAnthropicCompletionRequest(
 export async function* parseCopilotSseStream(
   body: NodeJS.ReadableStream
 ): AsyncGenerator<CopilotChatStreamChunk> {
+  const decoder = new TextDecoder('utf-8', { fatal: true });
   let buffer = '';
-
-  for await (const chunk of body) {
-    buffer += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8');
-
-    // SSE events are separated by a blank line.
-    let separator = /\r?\n\r?\n/.exec(buffer);
-    while (separator) {
-      const rawEvent = buffer.slice(0, separator.index);
-      buffer = buffer.slice(separator.index + separator[0].length);
-
-      const dataLines = rawEvent
-        .split(/\r?\n/)
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice(5).trim());
-
-      for (const data of dataLines) {
-        if (!data || data === '[DONE]') {
-          continue;
-        }
-        try {
-          yield JSON.parse(data) as CopilotChatStreamChunk;
-        } catch {
-          logger.warn('Skipping unparsable SSE payload from Copilot');
-        }
+  let dataLines: string[] = [];
+  let eventType = '';
+  let eventBytes = 0;
+  const decodedChunks = async function* () {
+    for await (const chunk of body) {
+      let text: string;
+      try {
+        text = decoder.decode(typeof chunk === 'string' ? Buffer.from(chunk) : chunk, {
+          stream: true,
+        });
+      } catch {
+        throw new CopilotApiError(502, 'Copilot returned invalid UTF-8 in its stream');
       }
-
-      separator = /\r?\n\r?\n/.exec(buffer);
+      yield { text, final: false };
     }
+    let text: string;
+    try {
+      text = decoder.decode();
+    } catch {
+      throw new CopilotApiError(502, 'Copilot returned incomplete UTF-8 in its stream');
+    }
+    yield { text, final: true };
+  };
+
+  try {
+    for await (const { text, final } of decodedChunks()) {
+      buffer += text;
+      let newline = /\r\n|\r|\n/.exec(buffer);
+      while (newline) {
+        // A CR at a network boundary may be the first half of CRLF.
+        if (!final && newline[0] === '\r' && newline.index === buffer.length - 1) {
+          break;
+        }
+        const line = buffer.slice(0, newline.index);
+        buffer = buffer.slice(newline.index + newline[0].length);
+        eventBytes += Buffer.byteLength(line) + newline[0].length;
+        if (eventBytes > MAX_SSE_EVENT_BYTES) {
+          throw new CopilotApiError(502, 'Copilot stream event exceeded the buffer limit');
+        }
+        if (line === '') {
+          const data = dataLines.join('\n');
+          if (eventType === 'error') {
+            throw new CopilotApiError(502, 'Copilot reported a streaming error');
+          }
+          dataLines = [];
+          eventType = '';
+          eventBytes = 0;
+          if (data.trim() === '[DONE]') {
+            return;
+          }
+          if (data) {
+            let parsed: CopilotChatStreamChunk;
+            try {
+              parsed = JSON.parse(data) as CopilotChatStreamChunk;
+            } catch {
+              throw new CopilotApiError(502, 'Copilot returned malformed stream data');
+            }
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.error) {
+              throw new CopilotApiError(502, 'Copilot reported an invalid stream response');
+            }
+            yield parsed;
+          }
+        } else {
+          const colon = line.indexOf(':');
+          const field = colon === -1 ? line : line.slice(0, colon);
+          const value = colon === -1 ? '' : line.slice(colon + 1).replace(/^ /, '');
+          if (field === 'data') {
+            dataLines.push(value);
+          } else if (field === 'event') {
+            eventType = value;
+          }
+        }
+        newline = /\r\n|\r|\n/.exec(buffer);
+      }
+      if (eventBytes + Buffer.byteLength(buffer) > MAX_SSE_EVENT_BYTES) {
+        throw new CopilotApiError(502, 'Copilot stream event exceeded the buffer limit');
+      }
+    }
+    throw new CopilotApiError(502, 'Copilot stream ended before its completion marker');
+  } finally {
+    destroyBody(body);
   }
 }
 
@@ -823,59 +888,76 @@ export async function* parseCopilotSseStream(
 // ============================================================================
 
 interface StreamingToolCall {
-  /** Index of the Anthropic content block for this tool call. */
-  blockIndex: number;
+  type: 'tool';
+  choiceIndex: number;
   id: string;
   name: string;
   argumentsJson: string;
+  complete: boolean;
+  bytes: number;
+}
+
+interface StreamingText {
+  type: 'text';
+  text: string;
 }
 
 /**
  * Run a streaming completion and yield Anthropic SSE events.
  *
- * When `config.anthropic.streamUpstream` is disabled, or the upstream response
- * is not a stream, this falls back to a buffered request and emits the same
- * event sequence so clients cannot tell the difference.
+ * When `config.anthropic.streamUpstream` is disabled, a buffered response is
+ * replayed as the same valid event sequence.
  */
 export async function* streamAnthropicMessage(
   request: AnthropicMessageRequest,
-  copilotToken: string
+  copilotToken: string,
+  signal?: AbortSignal
 ): AsyncGenerator<AnthropicStreamEvent> {
   const messageId = generateMessageId();
-  const toolNameMap = buildToolNameMap(request.tools);
-
-  if (!config.anthropic.streamUpstream) {
-    const response = await makeAnthropicCompletionRequest(request, copilotToken);
-    yield* replayResponseAsEvents(messageId, request.model, response);
-    return;
+  const mappedModel = mapClaudeModelToCopilot(request.model);
+  const toolNameMap = buildToolNameMap(request.tools, request.messages, request.tool_choice);
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  signal?.addEventListener('abort', onAbort, { once: true });
+  if (signal?.aborted) {
+    controller.abort();
   }
+  let response: Response | undefined;
 
-  const response = await postToCopilot(request, copilotToken, true);
-
-  if (!response.body) {
-    throw new CopilotApiError(502, 'Copilot returned an empty streaming response');
-  }
-
-  yield* convertCopilotStreamToAnthropicEvents(
-    parseCopilotSseStream(response.body as NodeJS.ReadableStream),
-    {
-      messageId,
-      model: request.model,
-      toolNameMap,
-      estimatedInputTokens: estimateInputTokens(request.messages, request.system, request.tools),
-      stopSequences: request.stop_sequences,
+  try {
+    if (!config.anthropic.streamUpstream) {
+      const completion = await makeAnthropicCompletionRequest(request, copilotToken, controller.signal);
+      yield* replayResponseAsEvents(messageId, completion.model, completion);
+      return;
     }
-  );
+    response = await postToCopilot(request, copilotToken, true, controller.signal);
+    if (!response.body) {
+      throw new CopilotApiError(502, 'Copilot returned an empty streaming response');
+    }
+    yield* convertCopilotStreamToAnthropicEvents(
+      parseCopilotSseStream(response.body),
+      {
+        messageId,
+        model: mappedModel,
+        toolNameMap,
+        estimatedInputTokens: estimateInputTokens(request.messages, request.system, request.tools),
+        stopSequences: request.stop_sequences,
+      }
+    );
+  } finally {
+    controller.abort();
+    signal?.removeEventListener('abort', onAbort);
+    destroyBody(response?.body ?? null);
+  }
 }
 
 /**
  * Convert a stream of Copilot chat chunks into a well-formed Anthropic SSE
  * event sequence.
  *
- * Content blocks are opened and closed in order, tool call argument fragments
- * are forwarded as `input_json_delta` events, and a text block is always
- * emitted even when the model returns nothing, because Anthropic clients
- * reject messages with no content blocks.
+ * Text streams immediately unless an earlier, unfinished tool blocks it.
+ * Parallel tools are buffered until their choice finishes, validated, and
+ * replayed in first-seen order so Anthropic blocks never overlap.
  */
 export async function* convertCopilotStreamToAnthropicEvents(
   chunks: AsyncIterable<CopilotChatStreamChunk>,
@@ -887,20 +969,54 @@ export async function* convertCopilotStreamToAnthropicEvents(
     stopSequences?: string[];
   }
 ): AsyncGenerator<AnthropicStreamEvent> {
-  const { messageId, model } = options;
+  const { messageId } = options;
+  let model = options.model;
   const toolNameMap = options.toolNameMap ?? new Map<string, string>();
   const stopSequences = options.stopSequences;
 
   let inputTokens = options.estimatedInputTokens ?? 0;
-  let outputTokens = 0;
+  let authoritativeOutputTokens: number | undefined;
+  let estimatedOutputUnits = 0;
   let startedMessage = false;
   let textBlockIndex: number | null = null;
   let nextBlockIndex = 0;
   let finishReason: string | null = null;
+  let sawFinish = false;
   // Text received but withheld because it may still complete a stop sequence.
   let pendingText = '';
   let stopSequenceHit: string | null = null;
-  const toolCalls = new Map<number, StreamingToolCall>();
+  const toolCalls = new Map<string, StreamingToolCall>();
+  const contentChoices = new Set<number>();
+  const finishedChoices = new Set<number>();
+  const toolIds = new Set<string>();
+  const queue: (StreamingToolCall | StreamingText)[] = [];
+  let bufferedBytes = 0;
+  let registeredBlocks = 0;
+
+  const checkBuffer = () => {
+    if (bufferedBytes + Buffer.byteLength(pendingText) > MAX_STREAM_BUFFER_BYTES ||
+        registeredBlocks > MAX_STREAM_BLOCKS || contentChoices.size > MAX_STREAM_BLOCKS) {
+      throw new CopilotApiError(502, 'Copilot stream exceeded the buffer limit');
+    }
+  };
+
+  const enqueueText = (text: string) => {
+    if (!text) {
+      return;
+    }
+    const tail = queue[queue.length - 1];
+    if (tail?.type === 'text') {
+      tail.text += text;
+    } else {
+      queue.push({ type: 'text', text });
+      // Consecutive immediate text deltas share the currently open block.
+      if (textBlockIndex === null || queue.length > 1) {
+        registeredBlocks++;
+      }
+    }
+    bufferedBytes += Buffer.byteLength(text);
+    checkBuffer();
+  };
 
   const emitMessageStart = function* (): Generator<AnthropicStreamEvent> {
     if (startedMessage) {
@@ -922,133 +1038,190 @@ export async function* convertCopilotStreamToAnthropicEvents(
     };
   };
 
-  for await (const chunk of chunks) {
-    if (chunk.usage) {
-      inputTokens = chunk.usage.prompt_tokens ?? inputTokens;
-      outputTokens = chunk.usage.completion_tokens ?? outputTokens;
-    }
-
-    const choice = chunk.choices?.[0];
-    if (!choice) {
-      continue;
-    }
-
-    if (choice.finish_reason) {
-      finishReason = choice.finish_reason;
-    }
-
-    const delta = choice.delta;
-    if (!delta) {
-      continue;
-    }
-
-    if (typeof delta.content === 'string' && delta.content.length > 0) {
+  const drain = function* (): Generator<AnthropicStreamEvent> {
+    while (queue.length > 0) {
+      const next = queue[0];
       yield* emitMessageStart();
-
-      if (textBlockIndex === null) {
-        textBlockIndex = nextBlockIndex++;
-        yield {
-          type: 'content_block_start',
-          index: textBlockIndex,
-          content_block: { type: 'text', text: '' },
-        };
-      }
-
-      outputTokens += Math.ceil(delta.content.length / CHARS_PER_TOKEN);
-
-      // `pendingText` only ever holds text that has not been emitted yet.
-      pendingText += delta.content;
-      const { text: safeText, matched } = applyStopSequences(pendingText, stopSequences);
-
-      if (matched) {
-        stopSequenceHit = matched;
-        pendingText = '';
-        if (safeText) {
+      if (next.type === 'text') {
+        if (textBlockIndex === null) {
+          textBlockIndex = nextBlockIndex++;
           yield {
-            type: 'content_block_delta',
+            type: 'content_block_start',
             index: textBlockIndex,
-            delta: { type: 'text_delta', text: safeText },
+            content_block: { type: 'text', text: '' },
           };
         }
-        break;
-      }
-
-      const hold = pendingStopSequenceLength(pendingText, stopSequences);
-      const emitText = hold > 0 ? pendingText.slice(0, pendingText.length - hold) : pendingText;
-      pendingText = hold > 0 ? pendingText.slice(pendingText.length - hold) : '';
-
-      if (emitText) {
         yield {
           type: 'content_block_delta',
           index: textBlockIndex,
-          delta: { type: 'text_delta', text: emitText },
+          delta: { type: 'text_delta', text: next.text },
         };
+        bufferedBytes -= Buffer.byteLength(next.text);
+        queue.shift();
+        continue;
       }
+      if (textBlockIndex !== null) {
+        yield { type: 'content_block_stop', index: textBlockIndex };
+        textBlockIndex = null;
+      }
+      if (!next.complete) {
+        return;
+      }
+      const index = nextBlockIndex++;
+      yield {
+        type: 'content_block_start',
+        index,
+        content_block: {
+          type: 'tool_use',
+          id: next.id,
+          name: toolNameMap.get(next.name) ?? next.name,
+          input: {},
+        },
+      };
+      yield {
+        type: 'content_block_delta',
+        index,
+        delta: { type: 'input_json_delta', partial_json: next.argumentsJson },
+      };
+      yield { type: 'content_block_stop', index };
+      bufferedBytes -= next.bytes;
+      next.argumentsJson = '';
+      next.bytes = 0;
+      queue.shift();
     }
+  };
 
-    for (const toolDelta of delta.tool_calls ?? []) {
-      yield* emitMessageStart();
-
-      const key = toolDelta.index ?? 0;
-      let tracked = toolCalls.get(key);
-
-      if (!tracked) {
-        // Close the text block first: Anthropic requires blocks to be
-        // opened and closed in order.
-        if (textBlockIndex !== null) {
-          yield { type: 'content_block_stop', index: textBlockIndex };
-          textBlockIndex = null;
+  stream: for await (const chunk of chunks) {
+    if (!chunk || chunk.error || (chunk.choices !== undefined && !Array.isArray(chunk.choices))) {
+      throw new CopilotApiError(502, 'Copilot returned an invalid stream response');
+    }
+    if (chunk.model) {
+      if (startedMessage && chunk.model !== model) {
+        throw new CopilotApiError(502, 'Copilot changed model identity during its stream');
+      }
+      model = chunk.model;
+    }
+    if (chunk.usage) {
+      inputTokens = chunk.usage.prompt_tokens ?? inputTokens;
+      authoritativeOutputTokens = chunk.usage.completion_tokens ?? authoritativeOutputTokens;
+    }
+    for (const [position, choice] of (chunk.choices ?? []).entries()) {
+      if (!choice || typeof choice !== 'object') {
+        throw new CopilotApiError(502, 'Copilot returned an invalid stream choice');
+      }
+      const choiceIndex = choice.index ?? position;
+      if (!Number.isInteger(choiceIndex) || choiceIndex < 0) {
+        throw new CopilotApiError(502, 'Copilot returned an invalid choice index');
+      }
+      const delta = choice.delta;
+      if (delta?.tool_calls !== undefined && !Array.isArray(delta.tool_calls)) {
+        throw new CopilotApiError(502, 'Copilot returned invalid tool fragments');
+      }
+      const hasContent = Boolean(delta?.content || delta?.tool_calls?.length);
+      if (hasContent && finishedChoices.has(choiceIndex)) {
+        throw new CopilotApiError(502, 'Copilot sent content after finishing a choice');
+      }
+      if (hasContent) {
+        contentChoices.add(choiceIndex);
+      }
+      if (typeof delta?.content === 'string' && delta.content.length > 0) {
+        estimatedOutputUnits += estimateTokenUnits(delta.content);
+        pendingText += delta.content;
+        checkBuffer();
+        const { text, matched } = applyStopSequences(pendingText, stopSequences);
+        const hold = matched ? 0 : pendingStopSequenceLength(text, stopSequences);
+        pendingText = hold > 0 ? text.slice(-hold) : '';
+        enqueueText(hold > 0 ? text.slice(0, -hold) : text);
+        yield* drain();
+        if (matched) {
+          stopSequenceHit = matched;
+          break stream;
         }
-
-        const rawName = toolDelta.function?.name ?? '';
-        tracked = {
-          blockIndex: nextBlockIndex++,
-          id: toolDelta.id || `toolu_${uuidv4().replace(/-/g, '').slice(0, 24)}`,
-          name: toolNameMap.get(rawName) ?? rawName,
-          argumentsJson: '',
-        };
-        toolCalls.set(key, tracked);
-
-        yield {
-          type: 'content_block_start',
-          index: tracked.blockIndex,
-          content_block: {
-            type: 'tool_use',
-            id: tracked.id,
-            name: tracked.name,
-            input: {},
-          },
-        };
       }
-
-      const argumentChunk = toolDelta.function?.arguments;
-      if (argumentChunk) {
-        tracked.argumentsJson += argumentChunk;
-        outputTokens += Math.ceil(argumentChunk.length / CHARS_PER_TOKEN);
-        yield {
-          type: 'content_block_delta',
-          index: tracked.blockIndex,
-          delta: { type: 'input_json_delta', partial_json: argumentChunk },
-        };
+      for (const toolDelta of delta?.tool_calls ?? []) {
+        if (!toolDelta || !Number.isInteger(toolDelta.index) || toolDelta.index < 0) {
+          throw new CopilotApiError(502, 'Copilot returned an invalid tool index');
+        }
+        const key = `${choiceIndex}:${toolDelta.index}`;
+        let tracked = toolCalls.get(key);
+        if (!tracked) {
+          // A tool starts a new content block; preserve the preceding text tail.
+          const tail = pendingText;
+          pendingText = '';
+          enqueueText(tail);
+          tracked = {
+            type: 'tool',
+            choiceIndex,
+            id: '',
+            name: '',
+            argumentsJson: '',
+            complete: false,
+            bytes: 0,
+          };
+          toolCalls.set(key, tracked);
+          queue.push(tracked);
+          registeredBlocks++;
+        }
+        const id = toolDelta.id ?? '';
+        const name = toolDelta.function?.name ?? '';
+        const argumentsJson = toolDelta.function?.arguments ?? '';
+        if (typeof id !== 'string' || typeof name !== 'string' ||
+            typeof argumentsJson !== 'string') {
+          throw new CopilotApiError(502, 'Copilot returned malformed tool fragments');
+        }
+        if (tracked.id.length + id.length > 512 || tracked.name.length + name.length > 64) {
+          throw new CopilotApiError(502, 'Copilot returned oversized tool metadata');
+        }
+        const addedBytes = Buffer.byteLength(id) + Buffer.byteLength(name) +
+          Buffer.byteLength(argumentsJson);
+        tracked.id += id;
+        tracked.name += name;
+        tracked.argumentsJson += argumentsJson;
+        tracked.bytes += addedBytes;
+        bufferedBytes += addedBytes;
+        estimatedOutputUnits += estimateTokenUnits(argumentsJson);
+        checkBuffer();
       }
+      if (choice.finish_reason) {
+        sawFinish = true;
+        if (finishedChoices.size >= MAX_STREAM_BLOCKS && !finishedChoices.has(choiceIndex)) {
+          throw new CopilotApiError(502, 'Copilot stream exceeded the choice limit');
+        }
+        finishedChoices.add(choiceIndex);
+        if (!finishReason || choice.finish_reason !== 'stop') {
+          finishReason = choice.finish_reason;
+        }
+        for (const tracked of toolCalls.values()) {
+          if (tracked.choiceIndex !== choiceIndex || tracked.complete) {
+            continue;
+          }
+          if (!tracked.id || !/^[a-zA-Z0-9_-]{1,64}$/.test(tracked.name) ||
+              toolIds.has(tracked.id)) {
+            throw new CopilotApiError(502, 'Copilot returned incomplete or duplicate tool metadata');
+          }
+          parseToolArguments(tracked.argumentsJson);
+          toolIds.add(tracked.id);
+          tracked.complete = true;
+        }
+      }
+      yield* drain();
     }
   }
 
-  yield* emitMessageStart();
-
-  // No stop sequence arrived, so the withheld tail was ordinary text.
-  if (pendingText && textBlockIndex !== null) {
-    yield {
-      type: 'content_block_delta',
-      index: textBlockIndex,
-      delta: { type: 'text_delta', text: pendingText },
-    };
-    pendingText = '';
+  if ((!stopSequenceHit && (!sawFinish ||
+      [...contentChoices].some((index) => !finishedChoices.has(index)))) ||
+      [...toolCalls.values()].some((tool) => !tool.complete)) {
+    throw new CopilotApiError(502, 'Copilot stream ended with an incomplete choice or tool call');
   }
+  const tail = pendingText;
+  pendingText = '';
+  enqueueText(tail);
+  yield* drain();
+  yield* emitMessageStart();
 
   if (textBlockIndex !== null) {
     yield { type: 'content_block_stop', index: textBlockIndex };
-  } else if (toolCalls.size === 0) {
+  } else if (nextBlockIndex === 0) {
     // The model produced nothing; still emit a well-formed empty text block.
     const emptyIndex = nextBlockIndex++;
     yield {
@@ -1059,10 +1232,6 @@ export async function* convertCopilotStreamToAnthropicEvents(
     yield { type: 'content_block_stop', index: emptyIndex };
   }
 
-  for (const tracked of toolCalls.values()) {
-    yield { type: 'content_block_stop', index: tracked.blockIndex };
-  }
-
   yield {
     type: 'message_delta',
     delta: {
@@ -1071,7 +1240,10 @@ export async function* convertCopilotStreamToAnthropicEvents(
         : mapFinishReasonToStopReason(finishReason, toolCalls.size > 0),
       stop_sequence: stopSequenceHit,
     },
-    usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+    usage: {
+      input_tokens: inputTokens,
+      output_tokens: authoritativeOutputTokens ?? Math.ceil(estimatedOutputUnits / 12),
+    },
   };
 
   yield { type: 'message_stop' };
@@ -1148,19 +1320,49 @@ function* replayResponseAsEvents(
 // ============================================================================
 
 /**
+ * Local heuristic in twelfths of a token, not a provider tokenizer. Count
+ * punctuation densely and non-ASCII text by UTF-8-sized units; unlike a flat
+ * chars/4 ratio this is conservative for code, CJK, and emoji. Integer units
+ * also make streamed estimates independent of chunk boundaries.
+ */
+function estimateTokenUnits(text: string): number {
+  let units = 0;
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdfff) {
+      units += 24;
+    } else if (code >= 0x800) {
+      units += 36;
+    } else if (code >= 0x80) {
+      units += 24;
+    } else if (/[a-zA-Z0-9]/.test(text[index])) {
+      units += 4;
+    } else if (/\s/.test(text[index])) {
+      units += 3;
+    } else {
+      units += 12;
+    }
+  }
+  return units;
+}
+
+/**
  * Estimate the input token count of a request without calling the model.
  * Used by `/v1/messages/count_tokens`, which Claude Code polls frequently.
+ * This is not an exact token count or a guaranteed upper bound. Image usage
+ * in particular depends on provider-specific resizing and image dimensions.
  */
 export function estimateInputTokens(
   messages: AnthropicMessage[],
   system?: AnthropicSystemPrompt,
   tools?: AnthropicTool[]
 ): number {
-  let characters = normalizeSystemPrompt(system).length;
+  let units = estimateTokenUnits(normalizeSystemPrompt(system));
 
   for (const message of messages ?? []) {
+    units += 12 * 8; // Approximate message framing.
     if (typeof message?.content === 'string') {
-      characters += message.content.length;
+      units += estimateTokenUnits(message.content);
       continue;
     }
 
@@ -1170,20 +1372,19 @@ export function estimateInputTokens(
       }
       switch (block.type) {
         case 'text':
-          characters += block.text.length;
+          units += estimateTokenUnits(block.text);
           break;
         case 'tool_use':
-          characters += block.name.length + JSON.stringify(block.input ?? {}).length;
+          units += estimateTokenUnits(block.name + JSON.stringify(block.input ?? {}));
           break;
         case 'tool_result':
-          characters += flattenToolResultContent(block.content).length;
+          units += estimateTokenUnits(flattenToolResultContent(block.content));
           break;
         case 'thinking':
-          characters += block.thinking.length;
+          units += estimateTokenUnits(block.thinking);
           break;
         case 'image':
-          // Images are billed on dimensions; use a flat, conservative estimate.
-          characters += 4 * CHARS_PER_TOKEN * 400;
+          units += 12 * 1600;
           break;
         default:
           break;
@@ -1192,11 +1393,11 @@ export function estimateInputTokens(
   }
 
   for (const tool of tools ?? []) {
-    characters += (tool.name?.length ?? 0) + (tool.description?.length ?? 0);
-    characters += JSON.stringify(tool.input_schema ?? {}).length;
+    units += estimateTokenUnits((tool.name ?? '') + (tool.description ?? ''));
+    units += estimateTokenUnits(JSON.stringify(tool.input_schema ?? {}));
   }
 
-  return Math.max(1, Math.ceil(characters / CHARS_PER_TOKEN));
+  return Math.max(1, Math.ceil(units / 12));
 }
 
 /**
