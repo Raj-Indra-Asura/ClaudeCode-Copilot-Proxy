@@ -105,6 +105,7 @@ function startTokenAutoRefresh(): void {
       }
     }
   }, 5 * 60 * 1000); // 5 minutes
+  tokenRefreshInterval.unref?.();
   
   logger.info('Token auto-refresh started');
 }
@@ -261,16 +262,20 @@ async function fetchCopilotToken(): Promise<CopilotToken> {
   }
 
   try {
-    const response = await upstreamFetch(config.github.copilot.apiEndpoints.GITHUB_COPILOT_TOKEN, {
-      method: 'GET',
-      headers: {
-        'Authorization': 'token ' + githubToken,
-        'Accept': 'application/json',
-        'Editor-Version': config.copilot.editorVersion,
-        'Editor-Plugin-Version': config.copilot.pluginVersion,
-        'User-Agent': config.copilot.userAgent
-      }
-    });
+    const response = await upstreamFetch(
+      config.github.copilot.apiEndpoints.GITHUB_COPILOT_TOKEN,
+      {
+        method: 'GET',
+        headers: {
+          'Authorization': 'token ' + githubToken,
+          'Accept': 'application/json',
+          'Editor-Version': config.copilot.editorVersion,
+          'Editor-Plugin-Version': config.copilot.pluginVersion,
+          'User-Agent': config.copilot.userAgent
+        }
+      },
+      { maxRetries: config.upstream.safeGetRetries }
+    );
 
     if (!response.ok) {
       destroyUpstreamBody(response);

@@ -107,3 +107,10 @@ it('exposes output budget clamping and can reject it', () => {
   config.anthropic.unsupportedFeatures = 'reject';
   expect(() => inspectRequestCompatibility(request)).toThrow(/max_tokens_clamped/);
 });
+
+it('reports context-window clamping and rejects inputs beyond the window', () => {
+  setModel({ maxOutputTokens: 1000, maxContextTokens: 40 });
+  expect(inspectRequestCompatibility(request)).toContain('context_window_clamped');
+  setModel({ maxContextTokens: 1 });
+  expect(() => inspectRequestCompatibility(request)).toThrow(/context window/);
+});

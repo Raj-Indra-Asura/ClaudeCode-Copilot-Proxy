@@ -16,6 +16,12 @@ const ALLOWED_HEADERS = new Set([
   'authorization', 'x-api-key', 'content-type', 'anthropic-version', 'anthropic-beta',
   'anthropic-dangerous-direct-browser-access', 'x-requested-with',
 ]);
+const EXPOSED_HEADERS = [
+  'X-Proxy-Warnings',
+  'X-Proxy-Resolved-Model',
+  'X-Proxy-Actual-Model',
+  'X-Proxy-Token-Count',
+];
 
 function isLoopback(host: string): boolean {
   const normalized = host.toLowerCase().replace(/^\[|\]$/g, '');
@@ -97,6 +103,7 @@ export function accessControl(options: AccessControlOptions): RequestHandler {
         return;
       }
       res.set('Access-Control-Allow-Origin', parsedOrigin.origin);
+      res.set('Access-Control-Expose-Headers', EXPOSED_HEADERS.join(', '));
       res.vary('Origin');
     } else if (['cross-site', 'same-site'].includes(req.get('Sec-Fetch-Site') ?? '')) {
       reject(403, 'Cross-site requests are not allowed');

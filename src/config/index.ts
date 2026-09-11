@@ -15,6 +15,7 @@ const envSchema = z.object({
   JSON_BODY_LIMIT: z.string().regex(/^\d+(?:kb|mb)$/i).default('10mb'),
   UPSTREAM_TIMEOUT_MS: z.coerce.number().int().min(100).max(3600000).default(300000),
   UPSTREAM_MAX_RETRIES: z.coerce.number().int().min(0).max(3).default(0),
+  UPSTREAM_SAFE_GET_RETRIES: z.coerce.number().int().min(0).max(3).default(2),
   UPSTREAM_MAX_RETRY_DELAY_MS: z.coerce.number().int().min(0).max(60000).default(10000),
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
   GITHUB_COPILOT_CLIENT_ID: z.string().default('Iv1.b507a08c87ecfe98'),
@@ -50,6 +51,7 @@ const env = envSchema.parse({
   JSON_BODY_LIMIT: process.env.JSON_BODY_LIMIT,
   UPSTREAM_TIMEOUT_MS: process.env.UPSTREAM_TIMEOUT_MS,
   UPSTREAM_MAX_RETRIES: process.env.UPSTREAM_MAX_RETRIES,
+  UPSTREAM_SAFE_GET_RETRIES: process.env.UPSTREAM_SAFE_GET_RETRIES,
   UPSTREAM_MAX_RETRY_DELAY_MS: process.env.UPSTREAM_MAX_RETRY_DELAY_MS,
   LOG_LEVEL: process.env.LOG_LEVEL,
   GITHUB_COPILOT_CLIENT_ID: process.env.GITHUB_COPILOT_CLIENT_ID,
@@ -198,6 +200,7 @@ export const config = {
   upstream: {
     timeoutMs: env.UPSTREAM_TIMEOUT_MS,
     maxRetries: env.UPSTREAM_MAX_RETRIES,
+    safeGetRetries: env.UPSTREAM_SAFE_GET_RETRIES,
     maxRetryDelayMs: env.UPSTREAM_MAX_RETRY_DELAY_MS,
   },
   logging: {

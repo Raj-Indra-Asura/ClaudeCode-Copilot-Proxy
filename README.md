@@ -24,7 +24,7 @@ or latency as `api.anthropic.com`.
 | **Images** | ✅ | `base64` / `url` image blocks → data URIs, with `Copilot-Vision-Request` |
 | **System prompts** | ✅ | Both the `string` and the block-array form Claude Code sends |
 | Sampling parameters | ✅ | `temperature`, `top_p`, `stop_sequences`, `max_tokens` |
-| `POST /v1/messages/count_tokens` | ✅ | Local estimate (no upstream call, no premium request) |
+| `POST /v1/messages/count_tokens` | ✅ | Local estimate, calibrated from authoritative upstream usage |
 | `GET /v1/models`, `GET /v1/models/:model` | ✅ | Anthropic pagination envelope |
 | Error semantics | ✅ | Upstream status codes and Anthropic error types are preserved |
 | Prompt caching (`cache_control`) | ➖ | No verified equivalent; warned about by default, optionally rejected |
@@ -41,6 +41,11 @@ or latency as `api.anthropic.com`.
   output budgets. `UNSUPPORTED_FEATURES=reject` fails these requests before sending
   them upstream. This mode may require disabling thinking/caching in the client;
   it does not add support for those features.
+- **Model and token behavior is observable.** `X-Proxy-Resolved-Model` identifies
+  the routed model, `X-Proxy-Actual-Model` reports the upstream response model,
+  and `X-Proxy-Token-Count` distinguishes heuristic from calibrated counts.
+  Published context windows also constrain the forwarded output budget before
+  an oversized request consumes a premium request.
 - **Streaming stays incremental for text.** Parallel tool fragments must sometimes
   be buffered to preserve Anthropic's sequential block lifecycle. Buffering is
   bounded; malformed or interrupted upstream streams fail instead of returning
@@ -49,9 +54,10 @@ or latency as `api.anthropic.com`.
   clients cancel active generation, and SSE writes respect slow-client backpressure.
   Retries default to **off** to avoid duplicate premium usage. Opt-in retries apply
   only to explicit 429/502/503/504 responses, never a partially delivered stream.
-- **Estimates are not provider accounting.** `X-Proxy-Token-Count: estimate`
-  identifies local counting. Unicode-aware estimates remain heuristic, not an exact
-  tokenizer or guaranteed context bound. Upstream usage wins when supplied.
+- **Estimates are not provider accounting.** `X-Proxy-Token-Count` is
+  `heuristic` until successful requests provide authoritative prompt usage, then
+  becomes `calibrated` for that model. No prompts are retained. Counts remain an
+  approximation rather than Anthropic billing or cache telemetry.
   The dashboard is not Copilot premium-request, cache, quota, or billing telemetry.
 
 For reproducible model comparisons, choose a concrete ID from `/v1/models`, not
@@ -526,7 +532,7 @@ To switch back to normal Cursor behaviour, turn off the base URL override.
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/messages` | Anthropic Messages API (also at `/anthropic/v1/messages`) |
-| `POST /v1/messages/count_tokens` | Local input-token estimate |
+| `POST /v1/messages/count_tokens` | Adaptive local input-token estimate |
 | `GET /v1/models`, `GET /v1/models/:model` | Model discovery |
 | `POST /openai/v1/chat/completions` | OpenAI-compatible surface for Cursor |
 | `GET /health` | Health check |
@@ -568,6 +574,7 @@ All settings are optional; see [`.env.example`](.env.example) for the full list.
 | `ENABLE_UPSTREAM_STREAMING` | `true` | Set to `false` to buffer upstream responses |
 | `UPSTREAM_TIMEOUT_MS` | `300000` | Per-fetch deadline through body consumption, including retries |
 | `UPSTREAM_MAX_RETRIES` | `0` | Opt-in bounded retries for explicit transient HTTP failures (maximum 3) |
+| `UPSTREAM_SAFE_GET_RETRIES` | `2` | Retries for idempotent Copilot token/catalog GETs |
 | `UPSTREAM_MAX_RETRY_DELAY_MS` | `10000` | Maximum retry wait; longer `Retry-After` values are passed back instead |
 | `RATE_LIMIT_DEFAULT` / `RATE_LIMIT_CHAT_COMPLETIONS` | `600` / `300` | Requests per minute (`0` disables) |
 | `MAX_TOKENS_PER_REQUEST` / `MAX_TOKENS_PER_MINUTE` | `0` | Optional token ceilings (`0` disables) |

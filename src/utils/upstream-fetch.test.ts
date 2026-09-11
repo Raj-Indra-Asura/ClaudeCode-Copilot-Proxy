@@ -53,6 +53,17 @@ describe('upstreamFetch', () => {
     expect(calls).toBe(2);
   });
 
+  it('allows safe callers to retry without enabling generation retries globally', async () => {
+    handler = (_req, res) => {
+      res.writeHead(calls === 1 ? 503 : 200, { 'Retry-After': '0' });
+      res.end('ok');
+    };
+    const response = await upstreamFetch(url, {}, { maxRetries: 1 });
+    expect(await response.text()).toBe('ok');
+    expect(calls).toBe(2);
+    expect(config.upstream.maxRetries).toBe(0);
+  });
+
   it('respects Retry-After without retrying earlier than the delay cap allows', async () => {
     config.upstream.maxRetries = 2;
     handler = (_req, res) => { res.writeHead(429, { 'Retry-After': '60' }); res.end(); };

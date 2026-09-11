@@ -126,7 +126,7 @@ function toCatalogModel(raw: RawCopilotModel): CatalogModel | null {
         : undefined,
     supportsTools: raw.capabilities?.supports?.tool_calls !== false,
     supportsVision:
-      raw.capabilities?.supports?.vision === true || limits?.vision !== undefined,
+      raw.capabilities?.supports?.vision !== false || limits?.vision !== undefined,
   };
 }
 
@@ -206,10 +206,14 @@ async function fetchCatalog(): Promise<CatalogModel[]> {
   const url = resolveModelsEndpoint();
 
   try {
-    const response = await upstreamFetch(url, {
-      method: 'GET',
-      headers: buildCopilotHeaders(token, { stream: false, hasImages: false }),
-    });
+    const response = await upstreamFetch(
+      url,
+      {
+        method: 'GET',
+        headers: buildCopilotHeaders(token, { stream: false, hasImages: false }),
+      },
+      { maxRetries: config.upstream.safeGetRetries }
+    );
 
     if (!response.ok) {
       logger.warn('Copilot model catalog request failed', {

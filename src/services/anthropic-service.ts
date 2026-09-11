@@ -40,10 +40,18 @@ import {
   CopilotToolChoice,
 } from '../types/copilot-chat.js';
 import { mapClaudeModelToCopilot } from '../utils/model-mapper.js';
-import { getCatalogOutputLimit } from './model-catalog.js';
 import { buildCopilotHeaders } from '../utils/copilot-headers.js';
 import { logger } from '../utils/logger.js';
 import { upstreamFetch } from '../utils/upstream-fetch.js';
+import { resolveRequestTokenBudget } from '../utils/token-budget.js';
+import {
+  estimateInputTokens,
+  estimateInputTokensDetailed,
+  estimateTokenUnits,
+  recordInputTokenObservation,
+} from '../utils/token-estimator.js';
+
+export { estimateInputTokens };
 
 const MAX_SSE_EVENT_BYTES = 1024 * 1024;
 const MAX_STREAM_BUFFER_BYTES = 4 * 1024 * 1024;
@@ -440,25 +448,16 @@ export function buildCopilotChatRequest(
   request: AnthropicMessageRequest,
   options: { stream: boolean }
 ): CopilotChatRequest {
-  const copilotModel = mapClaudeModelToCopilot(request.model);
+  const budget = resolveRequestTokenBudget(request);
 
   const body: CopilotChatRequest = {
-    model: copilotModel,
+    model: budget.model,
     messages: convertAnthropicMessagesToCopilot(request.messages, request.system),
     stream: options.stream,
   };
 
-  const maxTokens = request.max_tokens;
-  if (typeof maxTokens === 'number' && maxTokens > 0) {
-    // Copilot rejects a max_tokens above the model's published ceiling, and
-    // Claude Code asks for Anthropic-sized budgets, so clamp to whichever
-    // limit is lower.
-    const modelLimit = getCatalogOutputLimit(copilotModel);
-    const ceiling = Math.min(
-      config.anthropic.maxOutputTokens,
-      modelLimit ?? Number.POSITIVE_INFINITY
-    );
-    body.max_tokens = Math.min(maxTokens, ceiling);
+  if (typeof request.max_tokens === 'number' && request.max_tokens > 0) {
+    body.max_tokens = budget.effectiveMaxTokens;
   }
 
   if (typeof request.temperature === 'number') {
@@ -771,6 +770,12 @@ export async function makeAnthropicCompletionRequest(
   signal?: AbortSignal
 ): Promise<AnthropicMessageResponse> {
   const mappedModel = mapClaudeModelToCopilot(request.model);
+  const estimate = estimateInputTokensDetailed(
+    request.messages,
+    request.system,
+    request.tools,
+    mappedModel
+  );
   const response = await postToCopilot(request, copilotToken, false, signal);
   let data: CopilotChatResponse;
   try {
@@ -783,12 +788,17 @@ export async function makeAnthropicCompletionRequest(
   if (!data || data.error || !Array.isArray(data.choices)) {
     throw new CopilotApiError(502, 'Copilot returned an invalid completion');
   }
-  return convertCopilotToAnthropicResponse(
+  const result = convertCopilotToAnthropicResponse(
     data,
     mappedModel,
     buildToolNameMap(request.tools, request.messages, request.tool_choice),
     request.stop_sequences
   );
+  recordInputTokenObservation(mappedModel, estimate.rawInputTokens, result.usage.input_tokens);
+  if (result.model !== mappedModel) {
+    recordInputTokenObservation(result.model, estimate.rawInputTokens, result.usage.input_tokens);
+  }
+  return result;
 }
 
 /**
@@ -915,6 +925,12 @@ export async function* streamAnthropicMessage(
 ): AsyncGenerator<AnthropicStreamEvent> {
   const messageId = generateMessageId();
   const mappedModel = mapClaudeModelToCopilot(request.model);
+  const estimate = estimateInputTokensDetailed(
+    request.messages,
+    request.system,
+    request.tools,
+    mappedModel
+  );
   const toolNameMap = buildToolNameMap(request.tools, request.messages, request.tool_choice);
   const controller = new AbortController();
   const onAbort = () => controller.abort();
@@ -940,8 +956,22 @@ export async function* streamAnthropicMessage(
         messageId,
         model: mappedModel,
         toolNameMap,
-        estimatedInputTokens: estimateInputTokens(request.messages, request.system, request.tools),
+        estimatedInputTokens: estimate.inputTokens,
         stopSequences: request.stop_sequences,
+        onInputTokens: (actualModel, actualInputTokens) => {
+          recordInputTokenObservation(
+            mappedModel,
+            estimate.rawInputTokens,
+            actualInputTokens
+          );
+          if (actualModel !== mappedModel) {
+            recordInputTokenObservation(
+              actualModel,
+              estimate.rawInputTokens,
+              actualInputTokens
+            );
+          }
+        },
       }
     );
   } finally {
@@ -967,6 +997,7 @@ export async function* convertCopilotStreamToAnthropicEvents(
     toolNameMap?: Map<string, string>;
     estimatedInputTokens?: number;
     stopSequences?: string[];
+    onInputTokens?: (model: string, inputTokens: number) => void;
   }
 ): AsyncGenerator<AnthropicStreamEvent> {
   const { messageId } = options;
@@ -975,6 +1006,7 @@ export async function* convertCopilotStreamToAnthropicEvents(
   const stopSequences = options.stopSequences;
 
   let inputTokens = options.estimatedInputTokens ?? 0;
+  let authoritativeInputTokens: number | undefined;
   let authoritativeOutputTokens: number | undefined;
   let estimatedOutputUnits = 0;
   let startedMessage = false;
@@ -1102,7 +1134,10 @@ export async function* convertCopilotStreamToAnthropicEvents(
       model = chunk.model;
     }
     if (chunk.usage) {
-      inputTokens = chunk.usage.prompt_tokens ?? inputTokens;
+      if (typeof chunk.usage.prompt_tokens === 'number') {
+        inputTokens = chunk.usage.prompt_tokens;
+        authoritativeInputTokens = chunk.usage.prompt_tokens;
+      }
       authoritativeOutputTokens = chunk.usage.completion_tokens ?? authoritativeOutputTokens;
     }
     for (const [position, choice] of (chunk.choices ?? []).entries()) {
@@ -1232,6 +1267,10 @@ export async function* convertCopilotStreamToAnthropicEvents(
     yield { type: 'content_block_stop', index: emptyIndex };
   }
 
+  if (authoritativeInputTokens !== undefined) {
+    options.onInputTokens?.(model, authoritativeInputTokens);
+  }
+
   yield {
     type: 'message_delta',
     delta: {
@@ -1318,87 +1357,6 @@ function* replayResponseAsEvents(
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/**
- * Local heuristic in twelfths of a token, not a provider tokenizer. Count
- * punctuation densely and non-ASCII text by UTF-8-sized units; unlike a flat
- * chars/4 ratio this is conservative for code, CJK, and emoji. Integer units
- * also make streamed estimates independent of chunk boundaries.
- */
-function estimateTokenUnits(text: string): number {
-  let units = 0;
-  for (let index = 0; index < text.length; index++) {
-    const code = text.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdfff) {
-      units += 24;
-    } else if (code >= 0x800) {
-      units += 36;
-    } else if (code >= 0x80) {
-      units += 24;
-    } else if (/[a-zA-Z0-9]/.test(text[index])) {
-      units += 4;
-    } else if (/\s/.test(text[index])) {
-      units += 3;
-    } else {
-      units += 12;
-    }
-  }
-  return units;
-}
-
-/**
- * Estimate the input token count of a request without calling the model.
- * Used by `/v1/messages/count_tokens`, which Claude Code polls frequently.
- * This is not an exact token count or a guaranteed upper bound. Image usage
- * in particular depends on provider-specific resizing and image dimensions.
- */
-export function estimateInputTokens(
-  messages: AnthropicMessage[],
-  system?: AnthropicSystemPrompt,
-  tools?: AnthropicTool[]
-): number {
-  let units = estimateTokenUnits(normalizeSystemPrompt(system));
-
-  for (const message of messages ?? []) {
-    units += 12 * 8; // Approximate message framing.
-    if (typeof message?.content === 'string') {
-      units += estimateTokenUnits(message.content);
-      continue;
-    }
-
-    for (const block of Array.isArray(message?.content) ? message.content : []) {
-      if (!block || typeof block !== 'object') {
-        continue;
-      }
-      switch (block.type) {
-        case 'text':
-          units += estimateTokenUnits(block.text);
-          break;
-        case 'tool_use':
-          units += estimateTokenUnits(block.name + JSON.stringify(block.input ?? {}));
-          break;
-        case 'tool_result':
-          units += estimateTokenUnits(flattenToolResultContent(block.content));
-          break;
-        case 'thinking':
-          units += estimateTokenUnits(block.thinking);
-          break;
-        case 'image':
-          units += 12 * 1600;
-          break;
-        default:
-          break;
-      }
-    }
-  }
-
-  for (const tool of tools ?? []) {
-    units += estimateTokenUnits((tool.name ?? '') + (tool.description ?? ''));
-    units += estimateTokenUnits(JSON.stringify(tool.input_schema ?? {}));
-  }
-
-  return Math.max(1, Math.ceil(units / 12));
-}
 
 /**
  * Create an Anthropic-shaped error response body.

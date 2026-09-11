@@ -11,6 +11,10 @@ export class UpstreamTimeoutError extends Error {
   }
 }
 
+export interface UpstreamFetchOptions {
+  maxRetries?: number;
+}
+
 function abortError(): Error {
   const error = new Error('Upstream request aborted');
   error.name = 'AbortError';
@@ -43,7 +47,8 @@ function retryDelay(response: Response, attempt: number): number {
  */
 export async function upstreamFetch(
   url: string | URL,
-  init: RequestInit = {}
+  init: RequestInit = {},
+  options: UpstreamFetchOptions = {}
 ): Promise<Response> {
   const controller = new AbortController();
   const deadline = Date.now() + config.upstream.timeoutMs;
@@ -72,6 +77,10 @@ export async function upstreamFetch(
     typeof init.body === 'string' ||
     Buffer.isBuffer(init.body) ||
     init.body instanceof URLSearchParams;
+  const maxRetries = Math.max(
+    0,
+    Math.min(3, options.maxRetries ?? config.upstream.maxRetries)
+  );
 
   try {
     for (let attempt = 0; ; attempt++) {
@@ -87,7 +96,7 @@ export async function upstreamFetch(
       const delay = retryDelay(response, attempt);
       if (
         replayable &&
-        attempt < config.upstream.maxRetries &&
+        attempt < maxRetries &&
         [429, 502, 503, 504].includes(response.status) &&
         delay <= config.upstream.maxRetryDelayMs &&
         Date.now() + delay < deadline

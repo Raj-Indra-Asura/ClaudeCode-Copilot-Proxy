@@ -200,6 +200,7 @@ export interface AnthropicMessageRequest {
  * Request body for POST /v1/messages/count_tokens
  */
 export interface AnthropicCountTokensRequest {
+  /** Optional for compatibility; the configured default model is used when absent. */
   model?: string;
   messages: AnthropicMessage[];
   system?: AnthropicSystemPrompt;

@@ -1,7 +1,7 @@
 import { config } from '../config/index.js';
 import { findCatalogModel } from '../services/model-catalog.js';
 import { AnthropicMessageRequest, ContentBlock } from '../types/anthropic.js';
-import { mapClaudeModelToCopilot } from './model-mapper.js';
+import { resolveRequestTokenBudget } from './token-budget.js';
 
 export class RequestCompatibilityError extends Error {
   readonly status = 400;
@@ -18,7 +18,8 @@ export class RequestCompatibilityError extends Error {
  */
 export function inspectRequestCompatibility(request: AnthropicMessageRequest): string[] {
   const warnings = new Set<string>();
-  const model = mapClaudeModelToCopilot(request.model);
+  const budget = resolveRequestTokenBudget(request);
+  const model = budget.model;
   if (model !== request.model) {
     warnings.add('model_resolved');
   }
@@ -104,12 +105,11 @@ export function inspectRequestCompatibility(request: AnthropicMessageRequest): s
   if (hasImages && catalog?.supportsVision === false) {
     throw new RequestCompatibilityError(`Model '${model}' does not support images`);
   }
-  const ceiling = Math.min(
-    config.anthropic.maxOutputTokens,
-    catalog?.maxOutputTokens ?? Number.POSITIVE_INFINITY
-  );
-  if (request.max_tokens > ceiling) {
+  if (budget.outputLimitClamped) {
     warnings.add('max_tokens_clamped');
+  }
+  if (budget.contextWindowClamped) {
+    warnings.add('context_window_clamped');
   }
 
   const losses = [...warnings].filter((warning) => warning !== 'model_resolved');

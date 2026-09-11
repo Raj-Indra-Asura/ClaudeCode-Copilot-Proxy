@@ -16,11 +16,14 @@ import {
 import {
   CopilotApiError,
   createAnthropicError,
-  estimateInputTokens,
   makeAnthropicCompletionRequest,
   streamAnthropicMessage,
 } from '../services/anthropic-service.js';
-import { getAvailableModels, getModelById } from '../utils/model-mapper.js';
+import {
+  getAvailableModels,
+  getModelById,
+  mapClaudeModelToCopilot,
+} from '../utils/model-mapper.js';
 import { refreshModelCatalog } from '../services/model-catalog.js';
 import {
   AnthropicCountTokensRequest,
@@ -32,6 +35,13 @@ import { logger } from '../utils/logger.js';
 import { trackRequest, trackTokens } from '../services/usage-service.js';
 import { abortOnDisconnect, writeResponse } from '../utils/response-stream.js';
 import { UpstreamTimeoutError } from '../utils/upstream-fetch.js';
+import {
+  inspectRequestCompatibility,
+  RequestCompatibilityError,
+} from '../utils/request-policy.js';
+import { ContextWindowError } from '../utils/token-budget.js';
+import { estimateInputTokensDetailed } from '../utils/token-estimator.js';
+import { config } from '../config/index.js';
 
 export const anthropicRoutes = express.Router();
 
@@ -112,7 +122,8 @@ function validateMessageRequest(request: AnthropicMessageRequest): AnthropicErro
  * Translate a thrown error into an Anthropic error body plus HTTP status.
  */
 function toAnthropicErrorResponse(error: unknown): { status: number; body: AnthropicError } {
-  if (error instanceof Error && error.name === 'ModelSelectionError') {
+  if (error instanceof RequestCompatibilityError || error instanceof ContextWindowError ||
+      (error instanceof Error && error.name === 'ModelSelectionError')) {
     return { status: 400, body: createAnthropicError('invalid_request_error', error.message) };
   }
   if (error instanceof UpstreamTimeoutError) {
@@ -132,6 +143,24 @@ function toAnthropicErrorResponse(error: unknown): { status: number; body: Anthr
       'Internal server error'
     ),
   };
+}
+
+function setModelHeader(res: express.Response, name: string, model: string): void {
+  if (/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(model)) {
+    res.setHeader(name, model);
+  }
+}
+
+function setCompatibilityHeaders(
+  res: express.Response,
+  request: AnthropicMessageRequest
+): void {
+  const warnings = inspectRequestCompatibility(request);
+  const resolvedModel = mapClaudeModelToCopilot(request.model);
+  setModelHeader(res, 'X-Proxy-Resolved-Model', resolvedModel);
+  if (warnings.length > 0) {
+    res.setHeader('X-Proxy-Warnings', warnings.join(', '));
+  }
 }
 
 // GET /v1/models - list every Copilot model the account can use
@@ -154,11 +183,26 @@ anthropicRoutes.get('/models/:model', requireAuth, async (req, res) => {
   return res.json(model);
 });
 
-// POST /v1/messages/count_tokens - local token estimate
-anthropicRoutes.post('/messages/count_tokens', requireAuth, (req, res) => {
-  const { messages, system, tools } = (req.body ?? {}) as AnthropicCountTokensRequest;
+// POST /v1/messages/count_tokens - calibrated local token estimate
+anthropicRoutes.post('/messages/count_tokens', requireAuth, async (req, res) => {
+  const { model, messages, system, tools } = (req.body ?? {}) as AnthropicCountTokensRequest;
+  if (!Array.isArray(messages)) {
+    return res.status(400).json(
+      createAnthropicError('invalid_request_error', 'messages: field required')
+    );
+  }
 
-  res.json({ input_tokens: estimateInputTokens(messages ?? [], system, tools) });
+  try {
+    await refreshModelCatalog();
+    const resolvedModel = mapClaudeModelToCopilot(model || config.anthropic.defaultModel);
+    const estimate = estimateInputTokensDetailed(messages, system, tools, resolvedModel);
+    setModelHeader(res, 'X-Proxy-Resolved-Model', resolvedModel);
+    res.setHeader('X-Proxy-Token-Count', estimate.source);
+    return res.json({ input_tokens: estimate.inputTokens });
+  } catch (error) {
+    const { status, body } = toAnthropicErrorResponse(error);
+    return res.status(status).json(body);
+  }
 });
 
 // POST /v1/messages - the main Claude Code endpoint
@@ -178,13 +222,14 @@ anthropicRoutes.post('/messages', requireAuth, async (req, res) => {
       .json(createAnthropicError('authentication_error', 'GitHub Copilot token not available'));
   }
 
-  trackRequest(sessionId);
   const { signal, cleanup } = abortOnDisconnect(res);
   try {
     await refreshModelCatalog({ signal });
     if (signal.aborted) {
       return;
     }
+    setCompatibilityHeaders(res, request);
+    trackRequest(sessionId);
     if (request.stream) {
       return await handleStreamingMessage(res, request, copilotToken.token, sessionId, signal);
     }
@@ -193,6 +238,7 @@ anthropicRoutes.post('/messages', requireAuth, async (req, res) => {
     if (signal.aborted || res.destroyed) {
       return;
     }
+    setModelHeader(res, 'X-Proxy-Actual-Model', response.model);
     return res.json(response);
   } catch (error) {
     if (signal.aborted || res.destroyed) {
@@ -240,6 +286,9 @@ async function handleStreamingMessage(
         res.setHeader('Cache-Control', 'no-cache, no-transform');
         res.setHeader('Connection', 'keep-alive');
         res.setHeader('X-Accel-Buffering', 'no');
+        if (event.type === 'message_start') {
+          setModelHeader(res, 'X-Proxy-Actual-Model', event.message.model);
+        }
         res.flushHeaders();
       }
 
