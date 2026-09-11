@@ -24,6 +24,22 @@ const CLAUDE_FAMILIES = ['opus', 'sonnet', 'haiku', 'fable'] as const;
 /** Suffixes that mark a variant, so the plain model of a family wins ties. */
 const VARIANT_SUFFIX = /-(fast|thinking|preview|latest)$/;
 
+export class ModelSelectionError extends Error {
+  readonly status = 400;
+
+  constructor(model: string) {
+    super(`Model '${model}' is unavailable without substitution. Select an ID from /v1/models, a family alias, or explicitly set MODEL_SELECTION=compatible.`);
+    this.name = 'ModelSelectionError';
+  }
+}
+
+const FAMILY_ALIASES: Record<string, string> = {
+  opus: 'opus',
+  opusplan: 'opus',
+  sonnet: 'sonnet',
+  haiku: 'haiku',
+};
+
 /**
  * Extract the family keyword (`opus`, `sonnet`, ...) from a model name.
  */
@@ -109,6 +125,31 @@ function reconcileWithCatalog(candidate: string, requested: string): string {
  * @returns The corresponding Copilot model name
  */
 export function mapClaudeModelToCopilot(model: string): string {
+  if (config.anthropic.modelSelection === 'strict') {
+    const normalized = model?.trim().toLowerCase();
+    const live = findCatalogModel(normalized);
+    if (live) {
+      return live.id;
+    }
+
+    // Family aliases deliberately opt into a moving model, unlike versioned IDs.
+    const family = Object.hasOwn(FAMILY_ALIASES, normalized) ? FAMILY_ALIASES[normalized] : undefined;
+    if (family) {
+      if (getCatalogSnapshot().length === 0) {
+        return CLAUDE_MODEL_MAPPINGS[normalized];
+      }
+      const selected = bestCatalogModelForFamily(family);
+      if (selected) {
+        return selected.id;
+      }
+    } else if (getCatalogSnapshot().length === 0 &&
+               AVAILABLE_CLAUDE_MODELS.some((entry) => entry.id === normalized)) {
+      return normalized;
+    }
+
+    throw new ModelSelectionError(model);
+  }
+
   if (!model) {
     return resolveDefaultModel();
   }
@@ -140,7 +181,7 @@ export function mapClaudeModelToCopilot(model: string): string {
 
   // Longest matching prefix wins so dated suffixes resolve correctly.
   const prefixMatch = Object.keys(CLAUDE_MODEL_MAPPINGS)
-    .filter((key) => normalized.startsWith(key))
+    .filter((key) => normalized === key || normalized.startsWith(`${key}-`))
     .sort((a, b) => b.length - a.length)[0];
 
   if (prefixMatch) {
@@ -170,6 +211,15 @@ export function isValidClaudeModel(model: string): boolean {
   }
 
   const normalized = model.trim().toLowerCase();
+
+  if (config.anthropic.modelSelection === 'strict') {
+    try {
+      const resolved = mapClaudeModelToCopilot(model);
+      return findCatalogModel(resolved)?.isClaude ?? resolved.startsWith('claude-');
+    } catch {
+      return false;
+    }
+  }
 
   if (findCatalogModel(normalized)?.isClaude) {
     return true;
@@ -219,14 +269,14 @@ function listAdvertisedModels(): AnthropicModel[] {
     const picked = scoped.filter((model) => model.pickerEnabled);
     const exposed = picked.length > 0 ? picked : scoped;
 
-    if (exposed.length > 0) {
-      return exposed.map((model) =>
-        toAnthropicModel({ id: model.id, display_name: model.displayName })
-      );
-    }
+    return exposed.map((model) =>
+      toAnthropicModel({ id: model.id, display_name: model.displayName })
+    );
   }
 
-  return AVAILABLE_CLAUDE_MODELS.map(toAnthropicModel);
+  return AVAILABLE_CLAUDE_MODELS
+    .filter((model) => config.anthropic.exposeAllModels || model.id.startsWith('claude-'))
+    .map(toAnthropicModel);
 }
 
 /**
@@ -250,6 +300,15 @@ export function getAvailableModels(): AnthropicModelList {
  * @returns The model entry, or null when the model is not recognised
  */
 export function getModelById(modelId: string): AnthropicModel | null {
+  if (config.anthropic.modelSelection === 'strict') {
+    try {
+      const resolved = mapClaudeModelToCopilot(modelId);
+      return listAdvertisedModels().find((model) => model.id === resolved) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   const live = findCatalogModel(modelId);
   if (live) {
     return toAnthropicModel({ id: live.id, display_name: live.displayName });

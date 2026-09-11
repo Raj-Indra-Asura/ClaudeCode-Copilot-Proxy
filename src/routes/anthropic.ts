@@ -29,7 +29,9 @@ import {
   AnthropicStreamEvent,
 } from '../types/anthropic.js';
 import { logger } from '../utils/logger.js';
-import { trackRequest } from '../services/usage-service.js';
+import { trackRequest, trackTokens } from '../services/usage-service.js';
+import { abortOnDisconnect, writeResponse } from '../utils/response-stream.js';
+import { UpstreamTimeoutError } from '../utils/upstream-fetch.js';
 
 export const anthropicRoutes = express.Router();
 
@@ -50,11 +52,7 @@ const requireAuth = async (
     await ensureCopilotToken();
     return next();
   } catch (error) {
-    logger.warn(
-      `Copilot authentication unavailable: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    );
+    logger.warn('Copilot authentication unavailable');
     return res
       .status(401)
       .json(
@@ -84,10 +82,10 @@ function validateMessageRequest(request: AnthropicMessageRequest): AnthropicErro
     return createAnthropicError('invalid_request_error', 'messages: field required');
   }
 
-  if (typeof request.max_tokens !== 'number' || request.max_tokens <= 0) {
+  if (!Number.isSafeInteger(request.max_tokens) || request.max_tokens <= 0) {
     return createAnthropicError(
       'invalid_request_error',
-      'max_tokens: field required and must be a positive number'
+      'max_tokens: field required and must be a positive integer'
     );
   }
 
@@ -114,6 +112,12 @@ function validateMessageRequest(request: AnthropicMessageRequest): AnthropicErro
  * Translate a thrown error into an Anthropic error body plus HTTP status.
  */
 function toAnthropicErrorResponse(error: unknown): { status: number; body: AnthropicError } {
+  if (error instanceof Error && error.name === 'ModelSelectionError') {
+    return { status: 400, body: createAnthropicError('invalid_request_error', error.message) };
+  }
+  if (error instanceof UpstreamTimeoutError) {
+    return { status: 504, body: createAnthropicError('api_error', error.message) };
+  }
   if (error instanceof CopilotApiError) {
     return {
       status: error.status,
@@ -125,7 +129,7 @@ function toAnthropicErrorResponse(error: unknown): { status: number; body: Anthr
     status: 500,
     body: createAnthropicError(
       'api_error',
-      error instanceof Error ? error.message : 'Internal server error'
+      'Internal server error'
     ),
   };
 }
@@ -174,28 +178,39 @@ anthropicRoutes.post('/messages', requireAuth, async (req, res) => {
       .json(createAnthropicError('authentication_error', 'GitHub Copilot token not available'));
   }
 
-  trackRequest(sessionId, 0);
-
-  if (request.stream) {
-    return handleStreamingMessage(res, request, copilotToken.token, sessionId);
-  }
-
+  trackRequest(sessionId);
+  const { signal, cleanup } = abortOnDisconnect(res);
   try {
-    const response = await makeAnthropicCompletionRequest(request, copilotToken.token);
-    trackRequest(sessionId, response.usage.input_tokens + response.usage.output_tokens);
+    await refreshModelCatalog({ signal });
+    if (signal.aborted) {
+      return;
+    }
+    if (request.stream) {
+      return await handleStreamingMessage(res, request, copilotToken.token, sessionId, signal);
+    }
+    const response = await makeAnthropicCompletionRequest(request, copilotToken.token, signal);
+    trackTokens(sessionId, response.usage.input_tokens + response.usage.output_tokens);
+    if (signal.aborted || res.destroyed) {
+      return;
+    }
     return res.json(response);
   } catch (error) {
-    logger.error('Anthropic completion failed:', error);
+    if (signal.aborted || res.destroyed) {
+      return;
+    }
+    logger.error('Anthropic completion failed');
     const { status, body } = toAnthropicErrorResponse(error);
     return res.status(status).json(body);
+  } finally {
+    cleanup();
   }
 });
 
 /**
  * Write a single Anthropic SSE event.
  */
-function writeEvent(res: express.Response, event: AnthropicStreamEvent): void {
-  res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+function writeEvent(res: express.Response, event: AnthropicStreamEvent): Promise<boolean> {
+  return writeResponse(res, `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
 }
 
 /**
@@ -205,23 +220,14 @@ async function handleStreamingMessage(
   res: express.Response,
   request: AnthropicMessageRequest,
   copilotToken: string,
-  sessionId: string
+  sessionId: string,
+  signal: AbortSignal
 ): Promise<void> {
-  let clientGone = false;
-  // Listen on the response, not the request: `req` emits 'close' as soon as
-  // its body has been consumed, which would abort every stream immediately.
-  res.on('close', () => {
-    if (!res.writableEnded) {
-      clientGone = true;
-    }
-  });
-
+  let inputTokens = 0;
+  let outputTokens = 0;
   try {
-    let inputTokens = 0;
-    let outputTokens = 0;
-
-    for await (const event of streamAnthropicMessage(request, copilotToken)) {
-      if (clientGone) {
+    for await (const event of streamAnthropicMessage(request, copilotToken, signal)) {
+      if (signal.aborted || res.destroyed) {
         logger.debug('Client disconnected, aborting stream');
         break;
       }
@@ -244,19 +250,19 @@ async function handleStreamingMessage(
         outputTokens = event.usage.output_tokens;
       }
 
-      writeEvent(res, event);
+      if (!await writeEvent(res, event)) {
+        break;
+      }
     }
 
-    trackRequest(sessionId, inputTokens + outputTokens);
-
-    if (!clientGone) {
+    if (!signal.aborted && !res.destroyed) {
       res.end();
     }
   } catch (error) {
-    logger.error('Anthropic streaming failed:', error);
+    logger.error('Anthropic streaming failed');
     const { status, body } = toAnthropicErrorResponse(error);
 
-    if (clientGone) {
+    if (signal.aborted || res.destroyed) {
       return;
     }
 
@@ -265,7 +271,10 @@ async function handleStreamingMessage(
       return;
     }
 
-    writeEvent(res, { type: 'error', error: body.error });
-    res.end();
+    if (await writeEvent(res, { type: 'error', error: body.error })) {
+      res.end();
+    }
+  } finally {
+    trackTokens(sessionId, inputTokens + outputTokens);
   }
 }

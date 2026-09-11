@@ -1,5 +1,5 @@
 import { createOAuthDeviceAuth } from '@octokit/auth-oauth-device';
-import fetch from 'node-fetch';
+import { destroyUpstreamBody, upstreamFetch } from '../utils/upstream-fetch.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -57,7 +57,7 @@ export function loadPersistedTokens(): void {
       startTokenAutoRefresh();
     }
   } catch (error) {
-    logger.error('Error loading persisted tokens:', error);
+    logger.error('Error loading persisted tokens');
   }
 }
 
@@ -69,7 +69,7 @@ function saveGithubToken(token: string): void {
     fs.writeFileSync(GITHUB_TOKEN_FILE, JSON.stringify({ token }), { encoding: 'utf-8', mode: 0o600 });
     logger.debug('GitHub token saved to persistent storage');
   } catch (error) {
-    logger.error('Error saving GitHub token:', error);
+    logger.error('Error saving GitHub token');
   }
 }
 
@@ -81,7 +81,7 @@ function saveCopilotToken(token: CopilotToken): void {
     fs.writeFileSync(COPILOT_TOKEN_FILE, JSON.stringify(token), { encoding: 'utf-8', mode: 0o600 });
     logger.debug('Copilot token saved to persistent storage');
   } catch (error) {
-    logger.error('Error saving Copilot token:', error);
+    logger.error('Error saving Copilot token');
   }
 }
 
@@ -101,7 +101,7 @@ function startTokenAutoRefresh(): void {
         logger.info('Auto-refreshing Copilot token...');
         await refreshCopilotToken();
       } catch (error) {
-        logger.error('Auto-refresh failed:', error);
+        logger.error('Auto-refresh failed');
       }
     }
   }, 5 * 60 * 1000); // 5 minutes
@@ -137,7 +137,6 @@ export async function initiateDeviceFlow(): Promise<VerificationResponse> {
       onVerification(verification) {
         logger.info('Device verification initiated', { 
           verification_uri: verification.verification_uri,
-          user_code: verification.user_code 
         });
         
         // Store and resolve with verification info
@@ -167,14 +166,14 @@ export async function initiateDeviceFlow(): Promise<VerificationResponse> {
         // Start auto-refresh
         startTokenAutoRefresh();
         // Refresh Copilot token
-        refreshCopilotToken().catch((err) => {
-          logger.error('Failed to get Copilot token after auth:', err);
+        refreshCopilotToken().catch(() => {
+          logger.error('Failed to get Copilot token after auth');
         });
       }
-    }).catch((error) => {
+    }).catch(() => {
       // If verification hasn't been sent yet, reject
       if (!pendingVerification) {
-        logger.error('Failed to initiate device flow:', error);
+        logger.error('Failed to initiate device flow');
         pendingAuth = null;
         reject(new Error('Failed to initiate GitHub authentication'));
       }
@@ -238,7 +237,7 @@ export async function checkDeviceFlowAuth(): Promise<boolean> {
     }
     
     // Log other errors but don't throw - allow graceful degradation
-    logger.error('Error checking device flow auth:', error);
+    logger.error('Error checking device flow auth');
     return false;
   }
 }
@@ -248,12 +247,21 @@ export async function checkDeviceFlowAuth(): Promise<boolean> {
  * @returns Promise<CopilotToken> The refreshed Copilot token
  */
 export async function refreshCopilotToken(): Promise<CopilotToken> {
+  if (!refreshPromise) {
+    refreshPromise = fetchCopilotToken().finally(() => {
+      refreshPromise = null;
+    });
+  }
+  return refreshPromise;
+}
+
+async function fetchCopilotToken(): Promise<CopilotToken> {
   if (!githubToken) {
     throw new Error('GitHub token is required for refresh');
   }
 
   try {
-    const response = await fetch(config.github.copilot.apiEndpoints.GITHUB_COPILOT_TOKEN, {
+    const response = await upstreamFetch(config.github.copilot.apiEndpoints.GITHUB_COPILOT_TOKEN, {
       method: 'GET',
       headers: {
         'Authorization': 'token ' + githubToken,
@@ -265,7 +273,8 @@ export async function refreshCopilotToken(): Promise<CopilotToken> {
     });
 
     if (!response.ok) {
-      throw new Error(`Failed to get Copilot token: ${response.status} ${response.statusText}`);
+      destroyUpstreamBody(response);
+      throw new Error(`Failed to get Copilot token: ${response.status}`);
     }
 
     copilotToken = await response.json() as CopilotToken;
@@ -276,7 +285,7 @@ export async function refreshCopilotToken(): Promise<CopilotToken> {
     
     return copilotToken;
   } catch (error) {
-    logger.error('Error refreshing Copilot token:', error);
+    logger.error('Error refreshing Copilot token');
     throw error;
   }
 }
@@ -297,13 +306,7 @@ export async function ensureCopilotToken(): Promise<CopilotToken> {
     throw new Error('Not authenticated with GitHub');
   }
 
-  if (!refreshPromise) {
-    refreshPromise = refreshCopilotToken().finally(() => {
-      refreshPromise = null;
-    });
-  }
-
-  return refreshPromise;
+  return refreshCopilotToken();
 }
 
 /**
@@ -352,7 +355,7 @@ export function clearTokens(): void {
       fs.unlinkSync(COPILOT_TOKEN_FILE);
     }
   } catch (error) {
-    logger.error('Error deleting persisted tokens:', error);
+    logger.error('Error deleting persisted tokens');
   }
   
   logger.info('Authentication tokens cleared');

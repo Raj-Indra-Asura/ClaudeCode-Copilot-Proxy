@@ -1,4 +1,5 @@
 import { CatalogModel, setCatalogForTesting } from '../services/model-catalog.js';
+import { config } from '../config/index.js';
 import {
   getAvailableModels,
   getModelById,
@@ -22,16 +23,72 @@ const catalogModel = (
   ...overrides,
 });
 
+const originalSelection = config.anthropic.modelSelection;
+const originalExposure = config.anthropic.exposeAllModels;
+
 afterEach(() => {
   setCatalogForTesting([]);
+  config.anthropic.modelSelection = originalSelection;
+  config.anthropic.exposeAllModels = originalExposure;
 });
 
 describe('Model Mapper', () => {
+  beforeEach(() => {
+    config.anthropic.modelSelection = 'compatible';
+  });
+
   describe('mapClaudeModelToCopilot', () => {
     it('maps the dated identifiers Claude Code sends', () => {
       expect(mapClaudeModelToCopilot('claude-opus-4-5-20251101')).toBe('claude-opus-5');
       expect(mapClaudeModelToCopilot('claude-sonnet-4-5-20250929')).toBe('claude-sonnet-5');
       expect(mapClaudeModelToCopilot('claude-haiku-4-5-20251001')).toBe('claude-haiku-4.5');
+    });
+
+    describe('strict model selection', () => {
+      beforeEach(() => {
+        config.anthropic.modelSelection = 'strict';
+      });
+
+      it('does not silently replace dated or unknown models', () => {
+        expect(() => mapClaudeModelToCopilot('claude-sonnet-4-5-20250929')).toThrow(/without substitution/);
+        expect(() => mapClaudeModelToCopilot('claude-future-9')).toThrow(/without substitution/);
+        expect(() => mapClaudeModelToCopilot('')).toThrow(/without substitution/);
+        expect(() => mapClaudeModelToCopilot('__proto__')).toThrow(/without substitution/);
+      });
+
+      it('accepts concrete fallback IDs before the catalog is available', () => {
+        expect(mapClaudeModelToCopilot('claude-sonnet-5')).toBe('claude-sonnet-5');
+        expect(mapClaudeModelToCopilot('claude-opus-4.8-fast')).toBe('claude-opus-4.8-fast');
+      });
+
+      it('refuses retired concrete IDs once the live catalog is available', () => {
+        setCatalogForTesting([catalogModel('claude-sonnet-6')]);
+        expect(() => mapClaudeModelToCopilot('claude-sonnet-5')).toThrow(/without substitution/);
+        expect(mapClaudeModelToCopilot('CLAUDE-SONNET-6')).toBe('claude-sonnet-6');
+        expect(getModelById('claude-sonnet-5')).toBeNull();
+        expect(isValidClaudeModel('claude-sonnet-5')).toBe(false);
+      });
+
+      it('allows intentional family aliases, but never switches families', () => {
+        setCatalogForTesting([catalogModel('claude-sonnet-6')]);
+        expect(mapClaudeModelToCopilot('sonnet')).toBe('claude-sonnet-6');
+        expect(getModelById('sonnet')?.id).toBe('claude-sonnet-6');
+        expect(() => mapClaudeModelToCopilot('opus')).toThrow(/without substitution/);
+      });
+
+      it('filters non-Claude fallback entries unless explicitly enabled', () => {
+        config.anthropic.exposeAllModels = false;
+        expect(getAvailableModels().data.every((model) => model.id.startsWith('claude-'))).toBe(true);
+        expect(getModelById('gpt-5.5')).toBeNull();
+        config.anthropic.exposeAllModels = true;
+        expect(getAvailableModels().data.some((model) => model.id === 'gpt-5.5')).toBe(true);
+      });
+
+      it('does not advertise unavailable fallbacks when the live Claude list is empty', () => {
+        config.anthropic.exposeAllModels = false;
+        setCatalogForTesting([catalogModel('gpt-6', { isClaude: false, vendor: 'OpenAI' })]);
+        expect(getAvailableModels()).toMatchObject({ data: [], first_id: null, last_id: null });
+      });
     });
 
     it('prefers the longest matching prefix', () => {

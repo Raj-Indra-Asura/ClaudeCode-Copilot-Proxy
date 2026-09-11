@@ -10,6 +10,12 @@ const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.string().default('3000'),
   HOST: z.string().default('localhost'),
+  PROXY_AUTH_TOKEN: z.string().min(16).optional(),
+  PROXY_ALLOWED_ORIGINS: z.string().default(''),
+  JSON_BODY_LIMIT: z.string().regex(/^\d+(?:kb|mb)$/i).default('10mb'),
+  UPSTREAM_TIMEOUT_MS: z.coerce.number().int().min(100).max(3600000).default(300000),
+  UPSTREAM_MAX_RETRIES: z.coerce.number().int().min(0).max(3).default(0),
+  UPSTREAM_MAX_RETRY_DELAY_MS: z.coerce.number().int().min(0).max(60000).default(10000),
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
   GITHUB_COPILOT_CLIENT_ID: z.string().default('Iv1.b507a08c87ecfe98'),
   // Rate limiting settings (requests per minute)
@@ -26,8 +32,10 @@ const envSchema = z.object({
   DEFAULT_CLAUDE_MODEL: z.string().default('claude-sonnet-5'),
   // Set to 'true' to also advertise non-Claude Copilot models on /v1/models
   EXPOSE_ALL_COPILOT_MODELS: z.enum(['true', 'false']).default('false'),
+  MODEL_SELECTION: z.enum(['strict', 'compatible']).default('strict'),
+  UNSUPPORTED_FEATURES: z.enum(['warn', 'reject']).default('warn'),
   // Upper bound applied to max_tokens sent upstream
-  MAX_OUTPUT_TOKENS: z.string().default('64000'),
+  MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().max(1000000).default(64000),
   // Set to 'false' to fall back to buffered (non-streaming) upstream requests
   ENABLE_UPSTREAM_STREAMING: z.enum(['true', 'false']).default('true'),
 });
@@ -37,6 +45,12 @@ const env = envSchema.parse({
   NODE_ENV: process.env.NODE_ENV,
   PORT: process.env.PORT,
   HOST: process.env.HOST,
+  PROXY_AUTH_TOKEN: process.env.PROXY_AUTH_TOKEN,
+  PROXY_ALLOWED_ORIGINS: process.env.PROXY_ALLOWED_ORIGINS,
+  JSON_BODY_LIMIT: process.env.JSON_BODY_LIMIT,
+  UPSTREAM_TIMEOUT_MS: process.env.UPSTREAM_TIMEOUT_MS,
+  UPSTREAM_MAX_RETRIES: process.env.UPSTREAM_MAX_RETRIES,
+  UPSTREAM_MAX_RETRY_DELAY_MS: process.env.UPSTREAM_MAX_RETRY_DELAY_MS,
   LOG_LEVEL: process.env.LOG_LEVEL,
   GITHUB_COPILOT_CLIENT_ID: process.env.GITHUB_COPILOT_CLIENT_ID,
   RATE_LIMIT_DEFAULT: process.env.RATE_LIMIT_DEFAULT,
@@ -48,6 +62,8 @@ const env = envSchema.parse({
   COPILOT_USER_AGENT: process.env.COPILOT_USER_AGENT,
   DEFAULT_CLAUDE_MODEL: process.env.DEFAULT_CLAUDE_MODEL,
   EXPOSE_ALL_COPILOT_MODELS: process.env.EXPOSE_ALL_COPILOT_MODELS,
+  MODEL_SELECTION: process.env.MODEL_SELECTION,
+  UNSUPPORTED_FEATURES: process.env.UNSUPPORTED_FEATURES,
   MAX_OUTPUT_TOKENS: process.env.MAX_OUTPUT_TOKENS,
   ENABLE_UPSTREAM_STREAMING: process.env.ENABLE_UPSTREAM_STREAMING,
 });
@@ -143,6 +159,16 @@ export const AVAILABLE_CLAUDE_MODELS = [
     display_name: 'Claude Opus 4.7',
     copilot_model: 'claude-opus-4.7',
   },
+  {
+    id: 'claude-fable-5.1',
+    display_name: 'Claude Fable 5.1',
+    copilot_model: 'claude-fable-5.1',
+  },
+  {
+    id: 'claude-fable-5',
+    display_name: 'Claude Fable 5',
+    copilot_model: 'claude-fable-5',
+  },
   // Optional: GPT and Gemini models (pass-through, user must specify in settings)
   {
     id: 'gpt-5.5',
@@ -165,6 +191,14 @@ export const config = {
   server: {
     port: parseInt(env.PORT, 10),
     host: env.HOST,
+    authToken: env.PROXY_AUTH_TOKEN,
+    allowedOrigins: env.PROXY_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean),
+    bodyLimit: env.JSON_BODY_LIMIT,
+  },
+  upstream: {
+    timeoutMs: env.UPSTREAM_TIMEOUT_MS,
+    maxRetries: env.UPSTREAM_MAX_RETRIES,
+    maxRetryDelayMs: env.UPSTREAM_MAX_RETRY_DELAY_MS,
   },
   logging: {
     level: env.LOG_LEVEL,
@@ -188,7 +222,9 @@ export const config = {
   anthropic: {
     defaultModel: env.DEFAULT_CLAUDE_MODEL,
     exposeAllModels: env.EXPOSE_ALL_COPILOT_MODELS === 'true',
-    maxOutputTokens: parseInt(env.MAX_OUTPUT_TOKENS, 10),
+    modelSelection: env.MODEL_SELECTION,
+    unsupportedFeatures: env.UNSUPPORTED_FEATURES,
+    maxOutputTokens: env.MAX_OUTPUT_TOKENS,
     streamUpstream: env.ENABLE_UPSTREAM_STREAMING === 'true',
   },
   rateLimits: {

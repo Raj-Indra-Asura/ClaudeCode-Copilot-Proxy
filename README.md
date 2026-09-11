@@ -11,22 +11,52 @@ An **Anthropic Messages API-compatible** proxy that lets **Claude Code** run on 
 
 ## ✨ What works
 
-The proxy implements the parts of the Anthropic API that Claude Code actually exercises, so agentic workflows behave the same as they do against `api.anthropic.com`:
+The proxy translates the core Anthropic workflows that Claude Code exercises.
+It does **not** promise the same model build, reasoning quality, caching, quotas,
+or latency as `api.anthropic.com`.
 
 | Capability | Status | Notes |
 |---|---|---|
 | `POST /v1/messages` (buffered) | ✅ | Full request/response translation |
 | `POST /v1/messages` (streaming) | ✅ | True SSE pass-through from Copilot, not simulated |
 | **Tool calling** | ✅ | `tools`, `tool_choice`, `tool_use` ⇄ `tool_calls`, `tool_result` ⇄ `role: tool` |
-| **Streamed tool calls** | ✅ | `content_block_start` + `input_json_delta` fragments |
+| **Streamed tool calls** | ✅ | All choices are merged; interleaved tools are serialized into valid content blocks |
 | **Images** | ✅ | `base64` / `url` image blocks → data URIs, with `Copilot-Vision-Request` |
 | **System prompts** | ✅ | Both the `string` and the block-array form Claude Code sends |
 | Sampling parameters | ✅ | `temperature`, `top_p`, `stop_sequences`, `max_tokens` |
 | `POST /v1/messages/count_tokens` | ✅ | Local estimate (no upstream call, no premium request) |
 | `GET /v1/models`, `GET /v1/models/:model` | ✅ | Anthropic pagination envelope |
 | Error semantics | ✅ | Upstream status codes and Anthropic error types are preserved |
-| Prompt caching (`cache_control`) | ➖ | Accepted and ignored; Copilot manages caching server-side |
-| Extended thinking | ➖ | Accepted and ignored; Copilot does not expose thinking blocks |
+| Prompt caching (`cache_control`) | ➖ | No verified equivalent; warned about by default, optionally rejected |
+| Extended thinking | ➖ | No verified equivalent; warned about by default, optionally rejected |
+
+### Fidelity and reliability controls
+
+- **No silent version substitution by default.** `MODEL_SELECTION=strict` accepts
+  available Copilot IDs and intentional family aliases. Unavailable dated/versioned
+  IDs fail rather than selecting a different generation. Responses report the
+  upstream model ID (or the resolved request ID if upstream omits it).
+- **Unsupported semantics are explicit.** `X-Proxy-Warnings` reports ignored
+  thinking, cache boundaries, `top_k`, metadata, output configuration, and reduced
+  output budgets. `UNSUPPORTED_FEATURES=reject` fails these requests before sending
+  them upstream. This mode may require disabling thinking/caching in the client;
+  it does not add support for those features.
+- **Streaming stays incremental for text.** Parallel tool fragments must sometimes
+  be buffered to preserve Anthropic's sequential block lifecycle. Buffering is
+  bounded; malformed or interrupted upstream streams fail instead of returning
+  fabricated tool arguments or successful partial replies.
+- **Bounded requests.** Upstream deadlines include response bodies; disconnected
+  clients cancel active generation, and SSE writes respect slow-client backpressure.
+  Retries default to **off** to avoid duplicate premium usage. Opt-in retries apply
+  only to explicit 429/502/503/504 responses, never a partially delivered stream.
+- **Estimates are not provider accounting.** `X-Proxy-Token-Count: estimate`
+  identifies local counting. Unicode-aware estimates remain heuristic, not an exact
+  tokenizer or guaranteed context bound. Upstream usage wins when supplied.
+  The dashboard is not Copilot premium-request, cache, quota, or billing telemetry.
+
+For reproducible model comparisons, choose a concrete ID from `/v1/models`, not
+`sonnet`/`opus`/`haiku` aliases, and use the opt-in benchmark below. Even matching
+model labels cannot establish identical serving configurations.
 
 ## 📖 Contents
 
@@ -153,7 +183,7 @@ one-time step**. It survives restarts and reboots.
 
 ### Step 7 — Confirm the proxy is healthy
 
-Before wiring up Claude Code, prove the proxy works on its own. In your second
+Before wiring up Claude Code, check the proxy process. In your second
 terminal:
 
 ```bash
@@ -166,7 +196,8 @@ Expected:
 {"status":"healthy","version":"0.1.0"}
 ```
 
-Now check which models your account can actually reach:
+`/health` is a process liveness check, **not** an authentication or upstream
+availability probe. Now check the cached model catalog:
 
 ```bash
 curl -s http://localhost:3000/v1/models
@@ -191,8 +222,8 @@ curl -s http://localhost:3000/v1/messages \
 ```
 
 A JSON reply containing a `"text"` block means the whole chain — proxy, GitHub
-auth, Copilot — is working. **If this succeeds, any later problem is Claude Code
-configuration, not the proxy.**
+auth, Copilot — worked for this request. It does not establish compatibility for
+every model, large context, or tool workflow.
 
 <details>
 <summary>Windows PowerShell versions of the commands above</summary>
@@ -238,7 +269,9 @@ Put this in it:
 What each line does:
 
 - `ANTHROPIC_BASE_URL` — sends Claude Code to your proxy instead of Anthropic. **This is the key setting.**
-- `ANTHROPIC_AUTH_TOKEN` — a deliberate placeholder. Claude Code refuses to start without *some* value, but the proxy authorises using your GitHub Copilot token. Leave it as `sk-dummy`.
+- `ANTHROPIC_AUTH_TOKEN` — use the same secret as the server's `PROXY_AUTH_TOKEN`
+  when configured. The `sk-dummy` placeholder works only on a tokenless loopback
+  instance; it is not an access credential for a protected proxy.
 - `ANTHROPIC_MODEL` — your everyday model. `sonnet` is the best balance of cost and capability.
 - `ANTHROPIC_SMALL_FAST_MODEL` — the cheap model for background chores like conversation titles.
 - `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` — makes Claude Code call `GET /v1/models` on the proxy and list every model your Copilot plan can reach in `/model`. Without it the picker only ever offers the three alias slots (opus/sonnet/haiku).
@@ -356,6 +389,10 @@ claudecode-copilot-proxy
 
 The server starts at http://localhost:3000, and there is no build step.
 
+The published npm package may lag this checkout. The version number alone does
+not prove it includes these improvements; build from source to use the audited
+changes until a release containing them is published.
+
 ## 🤖 Claude Code configuration reference
 
 The settings file from Step 8 is the minimum. Everything below is optional
@@ -373,8 +410,9 @@ tuning.
 `GET /v1/models` is answered from your **live Copilot catalog** — the proxy calls
 Copilot's own `/models` endpoint with your token and advertises every Claude
 model your plan can actually serve (Pro+ accounts see the full Opus / Sonnet /
-Haiku range), refreshing it every 10 minutes. Nothing is hardcoded, so a model
-that GitHub adds or retires shows up without a code change.
+Haiku range), refreshing it every 10 minutes. A static fallback is used before the
+first successful fetch, and the last good snapshot survives temporary failures.
+Catalog entries are not a guarantee of current upstream availability.
 
 ```bash
 curl -s http://localhost:3000/v1/models | jq '.data[].id'
@@ -390,10 +428,13 @@ If your Claude Code build lists provider models in the `/model` picker, it will
 show exactly this list. Older builds show Anthropic's built-in presets instead —
 typing the ID after `/model`, or setting `ANTHROPIC_MODEL`, works either way.
 
-GitHub Copilot does **not** serve Anthropic's public model names, so Claude
-Code's identifiers (dated ones such as `claude-sonnet-4-5-20250929` and the
-`sonnet` / `opus` / `haiku` / `opusplan` aliases) are mapped onto whatever
-Copilot currently serves:
+GitHub Copilot uses its own IDs. By default, concrete IDs must be available
+without substitution; public dated names such as `claude-sonnet-4-5-20250929`
+are rejected unless offered verbatim. Short `sonnet` / `opus` / `haiku` /
+`opusplan` aliases deliberately select a moving model of that family.
+
+For legacy behavior, explicitly set `MODEL_SELECTION=compatible`. **Only in this
+opt-in mode** do older names use cross-version mappings such as:
 
 | Claude Code model | Copilot model |
 |---|---|
@@ -402,7 +443,7 @@ Copilot currently serves:
 | `claude-haiku-4-5*`, `claude-3-5-haiku*`, `haiku` | `claude-haiku-4.5` |
 | `claude-3-7-sonnet*`, `claude-3-5-sonnet*` | `claude-sonnet-5` |
 
-These are only defaults. Any ID present in your live catalog is forwarded
+In compatible mode these are only defaults. Any ID present in your live catalog is forwarded
 verbatim, and if a mapped target is *not* in your catalog the request is
 retargeted to the newest live model of the same family (Opus → newest Opus,
 Sonnet → newest Sonnet, ...). Unrecognised `claude-*` identifiers fall back to
@@ -424,7 +465,7 @@ GitHub bills Copilot usage in **premium requests**, and each model carries a mul
     "ANTHROPIC_SMALL_FAST_MODEL": "haiku",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku",
     "DISABLE_NON_ESSENTIAL_MODEL_CALLS": "1",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
   }
 }
 ```
@@ -447,12 +488,17 @@ Any other model your Copilot plan exposes is passed through untouched:
 Cursor speaks the OpenAI API rather than Anthropic's, so it uses a different
 base URL on the same running proxy.
 
+**Legacy/experimental:** this path still uses prompt-flattened code completions,
+not modern chat/tool/image semantics. The Claude Code improvements do not imply
+full Cursor or OpenAI compatibility.
+
 1. Complete Steps 1–6 above so the proxy is running and authenticated.
 2. Open Cursor IDE → **Settings** → **API Keys**.
 3. Enable **Override OpenAI Base URL** and set it to
    `http://localhost:3000/openai/v1` — note the `/openai/v1` suffix, which is
    where these routes are mounted.
-4. Enter any non-empty API key; as with Claude Code, it is a placeholder.
+4. Enter the server's `PROXY_AUTH_TOKEN` as the API key if configured; a placeholder
+   works only on a tokenless loopback instance.
 
 To switch back to normal Cursor behaviour, turn off the base URL override.
 
@@ -507,25 +553,53 @@ All settings are optional; see [`.env.example`](.env.example) for the full list.
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` / `HOST` | `3000` / `localhost` | Listen address |
+| `PROXY_AUTH_TOKEN` | unset | Shared inbound secret, at least 16 characters; mandatory off loopback |
+| `PROXY_ALLOWED_ORIGINS` | unset | Additional exact browser origins, comma-separated; requires authenticated access |
+| `JSON_BODY_LIMIT` | `10mb` | Maximum parsed JSON body; raise deliberately for larger images/contexts |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug` |
 | `COPILOT_CHAT_ENDPOINT` | *(from your Copilot token)* | Pin a GitHub Enterprise host or corporate proxy. Leave unset to use the account-specific host GitHub advertises, e.g. `api.individual.githubcopilot.com`. |
 | `COPILOT_INTEGRATION_ID` | `vscode-chat` | Client identity required by Copilot |
 | `COPILOT_EDITOR_VERSION` / `COPILOT_PLUGIN_VERSION` / `COPILOT_USER_AGENT` | vscode defaults | Client identity headers |
-| `DEFAULT_CLAUDE_MODEL` | `claude-sonnet-5` | Fallback for unknown Claude models |
+| `DEFAULT_CLAUDE_MODEL` | `claude-sonnet-5` | Fallback for unknown Claude models in compatible mode |
+| `MODEL_SELECTION` | `strict` | Reject version substitutions; `compatible` opts into legacy alias retargeting |
+| `UNSUPPORTED_FEATURES` | `warn` | Warn through response headers, or `reject` requests needing unsupported semantics |
 | `EXPOSE_ALL_COPILOT_MODELS` | `false` | Also advertise non-Claude models (GPT, Gemini) on `/v1/models` |
 | `MAX_OUTPUT_TOKENS` | `64000` | Ceiling applied to `max_tokens` (the model's own limit wins when lower) |
 | `ENABLE_UPSTREAM_STREAMING` | `true` | Set to `false` to buffer upstream responses |
+| `UPSTREAM_TIMEOUT_MS` | `300000` | Per-fetch deadline through body consumption, including retries |
+| `UPSTREAM_MAX_RETRIES` | `0` | Opt-in bounded retries for explicit transient HTTP failures (maximum 3) |
+| `UPSTREAM_MAX_RETRY_DELAY_MS` | `10000` | Maximum retry wait; longer `Retry-After` values are passed back instead |
 | `RATE_LIMIT_DEFAULT` / `RATE_LIMIT_CHAT_COMPLETIONS` | `600` / `300` | Requests per minute (`0` disables) |
 | `MAX_TOKENS_PER_REQUEST` / `MAX_TOKENS_PER_MINUTE` | `0` | Optional token ceilings (`0` disables) |
 
 ## 🐳 Docker
 
+Keep the published port loopback-only. The container binds to all interfaces
+internally, so it requires a real `PROXY_AUTH_TOKEN` even with this port mapping:
+
 ```bash
 docker build -t claudecode-copilot-proxy .
-docker run -p 3000:3000 -v ~/.github-copilot-proxy:/root/.github-copilot-proxy claudecode-copilot-proxy
+export PROXY_AUTH_TOKEN="$(openssl rand -hex 32)"
+docker run -p 127.0.0.1:3000:3000 -e PROXY_AUTH_TOKEN \
+  -v copilot-proxy-auth:/home/node/.github-copilot-proxy claudecode-copilot-proxy
 ```
 
-Mounting the token directory preserves your authentication across container restarts.
+Keep this secret securely for reuse and set Claude Code's `ANTHROPIC_AUTH_TOKEN`
+to the same value. Enter it on the authentication/usage pages when prompted.
+The pages keep it only in memory, not in URLs or browser storage.
+The named volume preserves authentication across container restarts. The image
+runs as the unprivileged `node` user; old root-owned bind mounts need ownership
+adjustments.
+
+### Network access
+
+API, authentication-control, and usage operations require the configured secret.
+Foreign browser origins and untrusted Host headers are rejected even on a
+tokenless localhost instance. Same-origin auth/usage pages remain usable; CORS is
+not wildcard-enabled. For a trusted HTTPS reverse proxy, configure the exact
+public origin in `PROXY_ALLOWED_ORIGINS` and preserve its Host header.
+Do not expose the raw HTTP server publicly: inbound authentication is not TLS,
+per-user isolation, or a production security guarantee.
 
 ## 🛠️ Development
 
@@ -541,12 +615,16 @@ npm run build      # Compile to dist/
 
 | Symptom | Cause and fix |
 |---|---|
-| `401 authentication_error` | Not signed in, or the GitHub token was revoked. Re-authenticate at http://localhost:3000. |
+| `401 authentication_error` | Missing/wrong proxy secret, or GitHub sign-in is unavailable/revoked. Check `PROXY_AUTH_TOKEN` first, then authenticate at http://localhost:3000. |
+| `400` unavailable model | Strict selection prevented a version substitution. Select a concrete `/v1/models` ID or intentional family alias. |
+| `400` unsupported semantics | Remove the reported options or explicitly select best-effort `UNSUPPORTED_FEATURES=warn`. |
 | `403 permission_error` | Your Copilot plan does not include the requested model. Pick another with `/model`. |
 | `429 rate_limit_error` | You hit the proxy's request limit or Copilot's. Raise `RATE_LIMIT_*` or wait for the `Retry-After` window. |
 | `404 not_found_error` on a model | The model is not offered by Copilot. Check `GET /v1/models`. |
 | Tools never fire | Confirm you are on this version: earlier releases dropped `tools` entirely. `npm run build` after pulling. |
 | Streaming looks buffered | A corporate proxy is buffering SSE. Set `ENABLE_UPSTREAM_STREAMING=false` as a fallback. |
+| `413` request too large | Raise `JSON_BODY_LIMIT` only as needed; the default is 10 MB. |
+| `504` upstream timeout | Upstream did not complete within the deadline; inspect connectivity or deliberately increase `UPSTREAM_TIMEOUT_MS`. |
 
 Run with `LOG_LEVEL=debug` to see the mapped model, message count, and tool count for every request.
 

@@ -1,4 +1,4 @@
-import fetch from 'node-fetch';
+import { destroyUpstreamBody, upstreamFetch } from '../utils/upstream-fetch.js';
 import { v4 as uuidv4 } from 'uuid';
 import { config } from '../config/index.js';
 import { 
@@ -107,7 +107,8 @@ export function detectLanguageFromMessages(messages: OpenAIMessage[]): string {
  */
 export async function makeCompletionRequest(
   request: OpenAICompletionRequest,
-  copilotToken: string
+  copilotToken: string,
+  signal?: AbortSignal
 ): Promise<CopilotCompletionResponse> {
   const { messages, temperature, max_tokens, top_p, n } = request;
   
@@ -136,8 +137,8 @@ export async function makeCompletionRequest(
     prompt,
     suffix,
     max_tokens: max_tokens || 500,
-    temperature: temperature || 0.7,
-    top_p: top_p || 1,
+    temperature: temperature ?? 0.7,
+    top_p: top_p ?? 1,
     n: n || 1,
     stream: false,
     stop: ["\n\n"],
@@ -149,26 +150,27 @@ export async function makeCompletionRequest(
   };
   
   try {
-    logger.debug('Making completion request to Copilot', { completionsUrl });
+    logger.debug('Making completion request to Copilot');
     
-    const response = await fetch(completionsUrl, {
+    const response = await upstreamFetch(completionsUrl, {
       method: 'POST',
       headers,
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal,
     });
     
     if (!response.ok) {
       logger.error('Copilot API error', { 
-        status: response.status, 
-        statusText: response.statusText 
+        status: response.status,
       });
-      throw new Error(`Copilot API error: ${response.status} ${response.statusText}`);
+      destroyUpstreamBody(response);
+      throw new Error(`Copilot API error: ${response.status}`);
     }
     
     const data = await response.json() as CopilotCompletionResponse;
     return data;
   } catch (error) {
-    logger.error('Error making completion request', { error });
+    logger.error('Error making completion request');
     throw error;
   }
 }
