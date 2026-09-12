@@ -504,74 +504,74 @@ benchmark('opt-in compatibility benchmark', () => {
     console.log(JSON.stringify(report, null, 2));
     expect(results).toHaveLength(samples * 4);
   }, MAX_SAMPLES * 6 * MAX_TIMEOUT_MS + 10_000);
+});
 
-  describe('offline harness checks', () => {
-    function frame(type: string, fields: Record<string, unknown> = {}): string {
-      return `event: ${type}\r\ndata: ${JSON.stringify({ type, ...fields })}\r\n\r\n`;
-    }
-    const start = () => frame('message_start', {
-      message: { id: 'msg_test', type: 'message', role: 'assistant', model: 'test-model', content: [], usage: { output_tokens: 1 } },
-    });
-    const end = () => frame('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 4 } })
+describe('offline compatibility benchmark checks', () => {
+  function frame(type: string, fields: Record<string, unknown> = {}): string {
+    return `event: ${type}\r\ndata: ${JSON.stringify({ type, ...fields })}\r\n\r\n`;
+  }
+  const start = () => frame('message_start', {
+    message: { id: 'msg_test', type: 'message', role: 'assistant', model: 'test-model', content: [], usage: { output_tokens: 1 } },
+  });
+  const end = () => frame('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 4 } })
+    + frame('message_stop');
+
+  test('handles byte-split UTF-8 and CRLF; message_start is not TTFT', async () => {
+    const collector = new MessageCollector(performance.now());
+    collector.accept('message_start', json(start().split('data: ')[1].trim()));
+    expect(collector.messageStartMs).not.toBeNull();
+    expect(collector.firstFragmentMs).toBeNull();
+    const text = frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
+      + frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'é' } })
+      + frame('content_block_stop', { index: 0 }) + end();
+    await consumeSse(Readable.from([...Buffer.from(text)].map(byte => Buffer.from([byte]))), collector);
+    expect(collector.blocks).toEqual([{ type: 'text', text: 'é' }]);
+    expect(collector.firstFragmentKind).toBe('text');
+    expect(collector.outputTokens).toBe(4);
+  });
+
+  test('reconstructs fragmented tool arguments before tool_result replay', async () => {
+    const collector = new MessageCollector(performance.now());
+    const text = start()
+      + frame('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'tool_1', name: 'add_integers', input: {} } })
+      + frame('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: '{"a":19,' } })
+      + frame('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: '"b":23}' } })
+      + frame('content_block_stop', { index: 0 })
+      + frame('message_delta', { delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 9 } })
       + frame('message_stop');
+    await consumeSse(Readable.from([text]), collector);
+    expect(collector.blocks).toEqual([{ type: 'tool_use', id: 'tool_1', name: 'add_integers', input: { a: 19, b: 23 } }]);
+    expect(collector.firstFragmentKind).toBe('tool');
+  });
 
-    test('handles byte-split UTF-8 and CRLF; message_start is not TTFT', async () => {
-      const collector = new MessageCollector(performance.now());
-      collector.accept('message_start', json(start().split('data: ')[1].trim()));
-      expect(collector.messageStartMs).not.toBeNull();
-      expect(collector.firstFragmentMs).toBeNull();
-      const text = frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
-        + frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'é' } })
-        + frame('content_block_stop', { index: 0 }) + end();
-      await consumeSse(Readable.from([...Buffer.from(text)].map(byte => Buffer.from([byte]))), collector);
-      expect(collector.blocks).toEqual([{ type: 'text', text: 'é' }]);
-      expect(collector.firstFragmentKind).toBe('text');
-      expect(collector.outputTokens).toBe(4);
-    });
+  test.each([
+    ['missing message_stop', start()],
+    ['delta before block start', start() + frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'x' } })],
+    ['unclosed block', start() + frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }) + end()],
+    ['duplicate message_start', start() + start()],
+    ['wrong block index', start() + frame('content_block_start', { index: 1, content_block: { type: 'text', text: '' } })],
+    ['OpenAI terminator', 'data: [DONE]\n\n'],
+  ])('rejects invalid lifecycle: %s', async (_label, text) => {
+    await expect(consumeSse(Readable.from([text]), new MessageCollector(performance.now()))).rejects.toBeInstanceOf(BenchmarkFailure);
+  });
 
-    test('reconstructs fragmented tool arguments before tool_result replay', async () => {
-      const collector = new MessageCollector(performance.now());
-      const text = start()
-        + frame('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'tool_1', name: 'add_integers', input: {} } })
-        + frame('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: '{"a":19,' } })
-        + frame('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: '"b":23}' } })
-        + frame('content_block_stop', { index: 0 })
-        + frame('message_delta', { delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 9 } })
-        + frame('message_stop');
-      await consumeSse(Readable.from([text]), collector);
-      expect(collector.blocks).toEqual([{ type: 'tool_use', id: 'tool_1', name: 'add_integers', input: { a: 19, b: 23 } }]);
-      expect(collector.firstFragmentKind).toBe('tool');
-    });
+  test('deadline covers a stalled SSE body, not just response headers', async () => {
+    const body = new Readable({ read() {} });
+    await expect(withDeadline(20, () => body.destroy(), () =>
+      consumeSse(body, new MessageCollector(performance.now()))
+    )).rejects.toMatchObject({ code: 'timeout' });
+    expect(body.destroyed).toBe(true);
+  });
 
-    test.each([
-      ['missing message_stop', start()],
-      ['delta before block start', start() + frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'x' } })],
-      ['unclosed block', start() + frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }) + end()],
-      ['duplicate message_start', start() + start()],
-      ['wrong block index', start() + frame('content_block_start', { index: 1, content_block: { type: 'text', text: '' } })],
-      ['OpenAI terminator', 'data: [DONE]\n\n'],
-    ])('rejects invalid lifecycle: %s', async (_label, text) => {
-      await expect(consumeSse(Readable.from([text]), new MessageCollector(performance.now()))).rejects.toBeInstanceOf(BenchmarkFailure);
-    });
-
-    test('deadline covers a stalled SSE body, not just response headers', async () => {
-      const body = new Readable({ read() {} });
-      await expect(withDeadline(20, () => body.destroy(), () =>
-        consumeSse(body, new MessageCollector(performance.now()))
-      )).rejects.toMatchObject({ code: 'timeout' });
-      expect(body.destroyed).toBe(true);
-    });
-
-    test('restricts proxy transport and redacts unsafe model identifiers', () => {
-      expect(proxyMessagesUrl('http://localhost:3000')).toBe('http://localhost:3000/v1/messages');
-      expect(proxyMessagesUrl('http://[::1]:3000')).toBe('http://[::1]:3000/v1/messages');
-      expect(proxyMessagesUrl('https://proxy.example/prefix/')).toBe('https://proxy.example/prefix/v1/messages');
-      for (const url of ['http://remote.example', '******proxy.example', 'https://proxy.example?key=secret', 'file:///etc/passwd']) {
-        expect(() => proxyMessagesUrl(url)).toThrow('BENCHMARK_PROXY_URL');
-      }
-      expect(safeModel('test-model', ['credential'])).toBe('test-model');
-      expect(safeModel('echo-credential', ['credential'])).toBe('[redacted]');
-      expect(safeModel('untrusted\ncontent', ['credential'])).toBe('[redacted]');
-    });
+  test('restricts proxy transport and redacts unsafe model identifiers', () => {
+    expect(proxyMessagesUrl('http://localhost:3000')).toBe('http://localhost:3000/v1/messages');
+    expect(proxyMessagesUrl('http://[::1]:3000')).toBe('http://[::1]:3000/v1/messages');
+    expect(proxyMessagesUrl('https://proxy.example/prefix/')).toBe('https://proxy.example/prefix/v1/messages');
+    for (const url of ['http://remote.example', '******proxy.example', 'https://proxy.example?key=secret', 'file:///etc/passwd']) {
+      expect(() => proxyMessagesUrl(url)).toThrow('BENCHMARK_PROXY_URL');
+    }
+    expect(safeModel('test-model', ['credential'])).toBe('test-model');
+    expect(safeModel('echo-credential', ['credential'])).toBe('[redacted]');
+    expect(safeModel('untrusted\ncontent', ['credential'])).toBe('[redacted]');
   });
 });

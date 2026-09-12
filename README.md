@@ -611,12 +611,40 @@ per-user isolation, or a production security guarantee.
 ## 🛠️ Development
 
 ```bash
-npm run dev        # Run from source with ts-node
+npm run dev        # Run from source with the ts-node ESM loader
 npm run typecheck  # tsc --noEmit
 npm run lint       # ESLint
 npm test           # Jest
 npm run build      # Compile to dist/
 ```
+
+`npm run dev` runs directly from source; restart it after edits. The packaged
+`claudecode-copilot-proxy start` command runs the compiled `dist` entrypoint
+and supports native Windows paths.
+
+### Checking compatibility against direct Anthropic
+
+Offline benchmark-parser checks run with `npm test`; live comparisons are opt-in
+and consume both direct API and Copilot quota. With the proxy running and
+authenticated, set these variables in PowerShell:
+
+```powershell
+# Supply ANTHROPIC_API_KEY and PROXY_AUTH_TOKEN securely, outside source control.
+$env:RUN_COMPATIBILITY_BENCHMARK = 'true'
+$env:BENCHMARK_PROXY_URL = 'http://localhost:3000'
+$env:BENCHMARK_ANTHROPIC_MODEL = '<exact-direct-Anthropic-model-ID>'
+$env:BENCHMARK_PROXY_MODEL = '<exact-ID-from-the-proxy-model-list>'
+$env:BENCHMARK_SAMPLES = '1'
+$env:BENCHMARK_TIMEOUT_MS = '30000'
+node --experimental-vm-modules .\node_modules\jest\bin\jest.js --runInBand compatibility-benchmark
+```
+
+Inspect the emitted JSON, not just Jest's exit status: live task mismatches are
+reported rather than asserted. The report separates contract/task success from
+first-fragment and total latency. Synthetic expected-output matches do not
+establish general coding quality, thinking/cache parity, or identical models.
+The OpenAI/Cursor path remains legacy/experimental and is not covered by the
+Anthropic A/B comparison.
 
 ## 🩺 Troubleshooting
 
