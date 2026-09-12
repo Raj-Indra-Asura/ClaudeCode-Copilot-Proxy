@@ -33,7 +33,10 @@ export interface CatalogModel {
   pickerEnabled: boolean;
   isChatDefault: boolean;
   maxOutputTokens?: number;
+  maxNonStreamingOutputTokens?: number;
+  maxPromptTokens?: number;
   maxContextTokens?: number;
+  supportedEndpoints?: string[];
   supportsTools: boolean;
   supportsVision: boolean;
 }
@@ -46,12 +49,15 @@ interface RawCopilotModel {
   preview?: boolean;
   model_picker_enabled?: boolean;
   is_chat_default?: boolean;
+  supported_endpoints?: string[];
   policy?: { state?: string };
   capabilities?: {
     type?: string;
     family?: string;
     limits?: {
       max_output_tokens?: number;
+      max_non_streaming_output_tokens?: number;
+      max_prompt_tokens?: number;
       max_context_window_tokens?: number;
       vision?: unknown;
     };
@@ -120,6 +126,11 @@ function toCatalogModel(raw: RawCopilotModel): CatalogModel | null {
     isChatDefault: raw.is_chat_default === true,
     maxOutputTokens:
       typeof limits?.max_output_tokens === 'number' ? limits.max_output_tokens : undefined,
+    maxNonStreamingOutputTokens: limits?.max_non_streaming_output_tokens,
+    maxPromptTokens: limits?.max_prompt_tokens,
+    supportedEndpoints: Array.isArray(raw.supported_endpoints)
+      ? raw.supported_endpoints.filter(endpoint => typeof endpoint === 'string')
+      : [],
     maxContextTokens:
       typeof limits?.max_context_window_tokens === 'number'
         ? limits.max_context_window_tokens

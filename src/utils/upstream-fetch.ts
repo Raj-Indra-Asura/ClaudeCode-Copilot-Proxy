@@ -15,6 +15,14 @@ export interface UpstreamFetchOptions {
   maxRetries?: number;
 }
 
+const responseSignals = new WeakMap<Response, AbortSignal>();
+
+/** Preserve timeout versus caller cancellation when node-fetch rejects a body read. */
+export function upstreamAbortReason(response: Response): unknown {
+  const signal = responseSignals.get(response);
+  return signal?.aborted ? signal.reason : undefined;
+}
+
 function abortError(): Error {
   const error = new Error('Upstream request aborted');
   error.name = 'AbortError';
@@ -127,6 +135,7 @@ export async function upstreamFetch(
         body.once('close', cleanup);
         body.once('error', cleanup);
       }
+      responseSignals.set(response, controller.signal);
       return response;
     }
   } catch (error) {

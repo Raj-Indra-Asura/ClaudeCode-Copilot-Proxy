@@ -31,7 +31,8 @@ This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get sta
 | Component | Purpose | Status |
 |-----------|---------|--------|
 | `routes/anthropic.ts` | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models` | ✅ Implemented |
-| `services/anthropic-service.ts` | Translate Anthropic ↔ Copilot, incl. tools, images, SSE | ✅ Implemented |
+| `services/native-anthropic.ts` | Native Messages/counting, opaque blocks/SSE, beta headers and cache usage | ✅ Implemented |
+| `services/anthropic-service.ts` | Chat fallback translation, incl. tools, images, SSE | ✅ Implemented |
 | `utils/model-mapper.ts` | Claude model name → Copilot model name | ✅ Implemented |
 | `services/model-catalog.ts` | Live `GET {endpoints.api}/models` catalog, cached 10 min | ✅ Implemented |
 | `types/anthropic.ts` | Anthropic Messages API types | ✅ Implemented |
@@ -41,14 +42,25 @@ This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get sta
 
 ### API Mappings
 
-**Anthropic Messages API → GitHub Copilot:**
+**Native Anthropic Messages API (preferred):**
 
-GitHub Copilot exposes the Claude models behind an **OpenAI-style chat completions**
-endpoint, so the translation is Anthropic Messages API ⇄ OpenAI chat completions.
+`ANTHROPIC_UPSTREAM_MODE=auto` uses native `/v1/messages` when the account's live
+catalog advertises it for the resolved Claude model. Native mode preserves all
+request fields except the resolved model ID, forwards `anthropic-version` and
+`anthropic-beta`, and retains response fields/SSE frames including thinking,
+signatures, cache usage and nested tool-result images. Counting uses the native
+`/v1/messages/count_tokens` endpoint. Native errors do not trigger chat retries.
+
+Do not apply chat sanitization, thinking removal or heuristic context clamping
+to native requests. Copilot itself validates native budgets. `native` mode
+requires advertised support or a configured native endpoint; `chat` mode forces
+translation. A configured chat endpoint keeps auto mode on chat.
+
+**Anthropic Messages API → OpenAI chat fallback only:**
 
 | Anthropic field | Copilot equivalent |
 |-----------------|--------------------|
-| `model` (e.g. `claude-sonnet-4-5-20250929`) | Mapped to `claude-sonnet-5` (longest-prefix match) |
+| `model` | Strict IDs/intentional family aliases by default; prefix retargeting only in compatible mode |
 | `messages` | `messages` array, roles preserved |
 | `system` (string or text blocks) | Leading `system` message |
 | `messages` entry with `role: 'system'` | Inline `system` message, kept in place (Claude Code's `mid-conversation-system-2026-04-07` beta) |
@@ -61,7 +73,7 @@ endpoint, so the translation is Anthropic Messages API ⇄ OpenAI chat completio
 | `max_tokens`, `temperature`, `top_p` | Same names |
 | `stop_sequences` | Sent as `stop`, but Copilot ignores it — enforced locally instead |
 | `stream` | `stream`, with SSE translated back into Anthropic events |
-| `cache_control`, `thinking` | Accepted and ignored (no Copilot equivalent) |
+| `cache_control`, `thinking` | Warned/rejected in chat mode; preserved in native mode |
 
 **Required upstream headers** (see `buildCopilotHeaders`): `Copilot-Integration-Id`,
 `Editor-Version`, `Editor-Plugin-Version`, `Machine-Id`, and `Copilot-Vision-Request`
@@ -80,7 +92,7 @@ account's live list from `GET {endpoints.api}/models`, which drives `/v1/models`
 alias retargeting and per-model `max_tokens` clamping. `CLAUDE_MODEL_MAPPINGS` is only
 the cold-start fallback used before the catalog loads.
 
-**Response shape**: a tool-calling reply is split across multiple `choices` entries
+**Chat response shape**: a tool-calling reply is split across multiple `choices` entries
 (text in one, `tool_calls` in another). Never read only `choices[0]`.
 
 ### Configuration for Claude Code
@@ -108,7 +120,7 @@ bd sync               # Sync with git
 ```bash
 npm install           # Install dependencies
 npm run build         # Build TypeScript
-npm run dev           # Development mode with hot reload
+npm run dev           # Transpile source with ts-node ESM; typecheck separately
 npm start             # Production mode
 ```
 
@@ -124,6 +136,9 @@ Tests live next to the code they cover (`*.test.ts`) and are excluded from the b
 The translation layer is designed to be testable without network access: prefer adding
 cases to `src/services/anthropic-service.test.ts` (pure converters and the
 `convertCopilotStreamToAnthropicEvents` generator) over mocking `fetch`.
+Native gateway contracts live in `src/routes/anthropic.native.test.ts` and use
+loopback HTTP fixtures to verify opaque payload/SSE forwarding, provider counting,
+usage, cancellation and retry/error semantics without real credentials.
 
 ## Landing the Plane (Session Completion)
 
@@ -150,4 +165,3 @@ cases to `src/services/anthropic-service.test.ts` (pure converters and the
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
-

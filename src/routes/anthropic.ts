@@ -42,6 +42,11 @@ import {
 import { ContextWindowError } from '../utils/token-budget.js';
 import { estimateInputTokensDetailed } from '../utils/token-estimator.js';
 import { config } from '../config/index.js';
+import {
+  isJsonObject, mergeNativeUsage, nativeFrames, nativeResponseHeaders, nativeTokenTotal,
+  NativeRequestHeaders, postNativeAnthropic, readNativeJson, usesNativeAnthropic,
+} from '../services/native-anthropic.js';
+import { destroyUpstreamBody } from '../utils/upstream-fetch.js';
 
 export const anthropicRoutes = express.Router();
 
@@ -163,6 +168,10 @@ function setCompatibilityHeaders(
   }
 }
 
+function requestHeaders(req: express.Request): NativeRequestHeaders {
+  return { version: req.get('anthropic-version'), beta: req.get('anthropic-beta') };
+}
+
 // GET /v1/models - list every Copilot model the account can use
 anthropicRoutes.get('/models', requireAuth, async (_req, res) => {
   await refreshModelCatalog();
@@ -183,25 +192,48 @@ anthropicRoutes.get('/models/:model', requireAuth, async (req, res) => {
   return res.json(model);
 });
 
-// POST /v1/messages/count_tokens - calibrated local token estimate
+// POST /v1/messages/count_tokens - native provider counting or explicit local estimate
 anthropicRoutes.post('/messages/count_tokens', requireAuth, async (req, res) => {
-  const { model, messages, system, tools } = (req.body ?? {}) as AnthropicCountTokensRequest;
+  const request = (req.body ?? {}) as AnthropicCountTokensRequest;
+  const { model, messages, system, tools } = request;
   if (!Array.isArray(messages)) {
     return res.status(400).json(
       createAnthropicError('invalid_request_error', 'messages: field required')
     );
   }
 
+  const { signal, cleanup } = abortOnDisconnect(res);
   try {
-    await refreshModelCatalog();
+    await refreshModelCatalog({ signal });
+    if (signal.aborted) return;
     const resolvedModel = mapClaudeModelToCopilot(model || config.anthropic.defaultModel);
-    const estimate = estimateInputTokensDetailed(messages, system, tools, resolvedModel);
     setModelHeader(res, 'X-Proxy-Resolved-Model', resolvedModel);
+    if (usesNativeAnthropic(resolvedModel)) {
+      const token = getCopilotToken();
+      if (!token) throw new CopilotApiError(401, 'GitHub Copilot token not available');
+      const upstream = await postNativeAnthropic(
+        request, resolvedModel, token.token, requestHeaders(req), signal, true
+      );
+      const body = await readNativeJson(upstream);
+      if (signal.aborted || res.destroyed) return;
+      if (upstream.ok && (!Number.isSafeInteger(body.input_tokens) || Number(body.input_tokens) < 0)) {
+        throw new CopilotApiError(502, 'Copilot returned invalid native token counting data');
+      }
+      res.set(nativeResponseHeaders(upstream));
+      res.setHeader('X-Proxy-Transport', 'native');
+      if (upstream.ok) res.setHeader('X-Proxy-Token-Count', 'upstream');
+      return res.status(upstream.status).json(body);
+    }
+    const estimate = estimateInputTokensDetailed(messages, system, tools, resolvedModel);
+    res.setHeader('X-Proxy-Transport', 'chat');
     res.setHeader('X-Proxy-Token-Count', estimate.source);
     return res.json({ input_tokens: estimate.inputTokens });
   } catch (error) {
+    if (signal.aborted || res.destroyed) return;
     const { status, body } = toAnthropicErrorResponse(error);
     return res.status(status).json(body);
+  } finally {
+    cleanup();
   }
 });
 
@@ -228,6 +260,17 @@ anthropicRoutes.post('/messages', requireAuth, async (req, res) => {
     if (signal.aborted) {
       return;
     }
+    const resolvedModel = mapClaudeModelToCopilot(request.model);
+    if (usesNativeAnthropic(resolvedModel)) {
+      setModelHeader(res, 'X-Proxy-Resolved-Model', resolvedModel);
+      res.setHeader('X-Proxy-Transport', 'native');
+      if (resolvedModel !== request.model) res.setHeader('X-Proxy-Warnings', 'model_resolved');
+      trackRequest(sessionId);
+      return await handleNativeMessage(
+        res, request, resolvedModel, copilotToken.token, sessionId, signal, requestHeaders(req)
+      );
+    }
+    res.setHeader('X-Proxy-Transport', 'chat');
     setCompatibilityHeaders(res, request);
     trackRequest(sessionId);
     if (request.stream) {
@@ -257,6 +300,79 @@ anthropicRoutes.post('/messages', requireAuth, async (req, res) => {
  */
 function writeEvent(res: express.Response, event: AnthropicStreamEvent): Promise<boolean> {
   return writeResponse(res, `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+}
+
+async function handleNativeMessage(
+  res: express.Response,
+  request: AnthropicMessageRequest,
+  model: string,
+  token: string,
+  sessionId: string,
+  signal: AbortSignal,
+  headers: NativeRequestHeaders
+): Promise<void> {
+  const upstream = await postNativeAnthropic(request, model, token, headers, signal);
+  let usage: Record<string, unknown> = {};
+  try {
+    res.set(nativeResponseHeaders(upstream));
+    if (!upstream.ok || !request.stream) {
+      const body = await readNativeJson(upstream);
+      if (signal.aborted || res.destroyed) return;
+      if (upstream.ok) {
+        if (body.type !== 'message' || body.role !== 'assistant' || !Array.isArray(body.content)) {
+          throw new CopilotApiError(502, 'Copilot returned an invalid native message');
+        }
+        usage = mergeNativeUsage(usage, body.usage);
+        if (typeof body.model === 'string') setModelHeader(res, 'X-Proxy-Actual-Model', body.model);
+      }
+      res.status(upstream.status).json(body);
+      return;
+    }
+    if (!upstream.headers.get('content-type')?.includes('text/event-stream')) {
+      throw new CopilotApiError(502, 'Copilot did not return a native event stream');
+    }
+    let started = false;
+    let finished = false;
+    for await (const frame of nativeFrames(upstream)) {
+      if (signal.aborted || res.destroyed) return;
+      const event = frame.event;
+      if (event?.type === 'message_start') {
+        if (started || !isJsonObject(event.message)) {
+          throw new CopilotApiError(502, 'Copilot returned an invalid native message_start');
+        }
+        started = true;
+        usage = mergeNativeUsage(usage, event.message.usage);
+        if (!res.headersSent && typeof event.message.model === 'string') {
+          setModelHeader(res, 'X-Proxy-Actual-Model', event.message.model);
+        }
+      } else if (event?.type === 'message_delta') {
+        if (!started) throw new CopilotApiError(502, 'Copilot sent a native delta before message_start');
+        usage = mergeNativeUsage(usage, event.usage);
+        finished = isJsonObject(event.delta) && typeof event.delta.stop_reason === 'string';
+      } else if (event?.type === 'message_stop' && (!started || !finished)) {
+        throw new CopilotApiError(502, 'Copilot ended a native message before its final delta');
+      }
+      if (!res.headersSent) {
+        res.status(200).set({
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        });
+      }
+      if (!await writeResponse(res, frame.raw)) return;
+    }
+    if (!signal.aborted && !res.destroyed) res.end();
+  } catch (error) {
+    if (signal.aborted || res.destroyed) return;
+    if (!res.headersSent) throw error;
+    logger.error('Native Anthropic streaming failed');
+    const { body } = toAnthropicErrorResponse(error);
+    if (await writeEvent(res, { type: 'error', error: body.error })) res.end();
+  } finally {
+    destroyUpstreamBody(upstream);
+    trackTokens(sessionId, nativeTokenTotal(usage));
+  }
 }
 
 /**

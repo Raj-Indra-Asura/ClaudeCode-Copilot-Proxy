@@ -66,7 +66,9 @@ it('starts the configured source launcher in ESM mode without existing credentia
   const closed = once(child, 'close');
   try {
     await new Promise<void>((resolve, reject) => {
-      timer = setTimeout(() => reject(new Error('Source launcher did not start')), 20000);
+      timer = setTimeout(() => reject(new Error(
+        `Source launcher did not start. stdout: ${stdout.slice(-1000)} stderr: ${stderr.slice(-1000)}`
+      )), 20000);
       child.once('error', reject);
       child.once('exit', code => reject(new Error(`Source launcher exited (${code}): ${stderr}`)));
       child.stderr.on('data', chunk => { stderr += chunk.toString(); });

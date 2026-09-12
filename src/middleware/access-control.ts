@@ -21,6 +21,9 @@ const EXPOSED_HEADERS = [
   'X-Proxy-Resolved-Model',
   'X-Proxy-Actual-Model',
   'X-Proxy-Token-Count',
+  'X-Proxy-Transport',
+  'request-id',
+  'Retry-After',
 ];
 
 function isLoopback(host: string): boolean {

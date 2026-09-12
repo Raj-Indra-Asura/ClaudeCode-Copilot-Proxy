@@ -8,8 +8,8 @@
 // ============================================================================
 
 /**
- * Prompt-caching marker. Warned about or rejected by the compatibility policy;
- * Copilot chat completions has no verified equivalent cache-boundary semantics.
+ * Prompt-caching marker, preserved by native routing. The chat translator
+ * warns about or rejects it because it cannot preserve cache boundaries.
  */
 export interface CacheControl {
   type: 'ephemeral';
@@ -183,10 +183,10 @@ export interface AnthropicMessageRequest {
   /** How to handle tool use */
   tool_choice?: AnthropicToolChoice;
   
-  /** Extended thinking configuration (accepted, not forwarded to Copilot) */
+  /** Preserved by native routing; warned/rejected in chat translation. */
   thinking?: AnthropicThinkingConfig;
 
-  /** Automatic caching and output configuration have no verified chat equivalent. */
+  /** Preserved natively; no verified equivalent in the chat translator. */
   cache_control?: CacheControl;
   output_config?: Record<string, unknown>;
   
@@ -205,6 +205,8 @@ export interface AnthropicCountTokensRequest {
   messages: AnthropicMessage[];
   system?: AnthropicSystemPrompt;
   tools?: AnthropicTool[];
+  thinking?: AnthropicThinkingConfig;
+  tool_choice?: AnthropicToolChoice;
 }
 
 /**
@@ -269,7 +271,7 @@ export interface AnthropicMessageResponse {
 }
 
 // ============================================================================
-// Streaming Event Types
+// Chat translator event types; native routing forwards opaque provider frames.
 // ============================================================================
 
 /**

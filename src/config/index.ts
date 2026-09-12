@@ -24,6 +24,7 @@ const envSchema = z.object({
   RATE_LIMIT_CHAT_COMPLETIONS: z.string().default('300'),
   // GitHub Copilot chat endpoint (override for enterprise/proxy setups)
   COPILOT_CHAT_ENDPOINT: z.string().url().default('https://api.githubcopilot.com/chat/completions'),
+  COPILOT_MESSAGES_ENDPOINT: z.string().url().optional(),
   // Identity headers required by the Copilot chat API
   COPILOT_INTEGRATION_ID: z.string().default('vscode-chat'),
   COPILOT_EDITOR_VERSION: z.string().default('vscode/1.99.3'),
@@ -34,6 +35,7 @@ const envSchema = z.object({
   // Set to 'true' to also advertise non-Claude Copilot models on /v1/models
   EXPOSE_ALL_COPILOT_MODELS: z.enum(['true', 'false']).default('false'),
   MODEL_SELECTION: z.enum(['strict', 'compatible']).default('strict'),
+  ANTHROPIC_UPSTREAM_MODE: z.enum(['auto', 'native', 'chat']).default('auto'),
   UNSUPPORTED_FEATURES: z.enum(['warn', 'reject']).default('warn'),
   // Upper bound applied to max_tokens sent upstream
   MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().max(1000000).default(64000),
@@ -58,6 +60,7 @@ const env = envSchema.parse({
   RATE_LIMIT_DEFAULT: process.env.RATE_LIMIT_DEFAULT,
   RATE_LIMIT_CHAT_COMPLETIONS: process.env.RATE_LIMIT_CHAT_COMPLETIONS,
   COPILOT_CHAT_ENDPOINT: process.env.COPILOT_CHAT_ENDPOINT,
+  COPILOT_MESSAGES_ENDPOINT: process.env.COPILOT_MESSAGES_ENDPOINT,
   COPILOT_INTEGRATION_ID: process.env.COPILOT_INTEGRATION_ID,
   COPILOT_EDITOR_VERSION: process.env.COPILOT_EDITOR_VERSION,
   COPILOT_PLUGIN_VERSION: process.env.COPILOT_PLUGIN_VERSION,
@@ -65,6 +68,7 @@ const env = envSchema.parse({
   DEFAULT_CLAUDE_MODEL: process.env.DEFAULT_CLAUDE_MODEL,
   EXPOSE_ALL_COPILOT_MODELS: process.env.EXPOSE_ALL_COPILOT_MODELS,
   MODEL_SELECTION: process.env.MODEL_SELECTION,
+  ANTHROPIC_UPSTREAM_MODE: process.env.ANTHROPIC_UPSTREAM_MODE,
   UNSUPPORTED_FEATURES: process.env.UNSUPPORTED_FEATURES,
   MAX_OUTPUT_TOKENS: process.env.MAX_OUTPUT_TOKENS,
   ENABLE_UPSTREAM_STREAMING: process.env.ENABLE_UPSTREAM_STREAMING,
@@ -221,11 +225,13 @@ export const config = {
     // Only set when the user pinned an endpoint; otherwise the endpoint
     // advertised by the Copilot token wins.
     chatEndpointOverride: process.env.COPILOT_CHAT_ENDPOINT,
+    messagesEndpointOverride: env.COPILOT_MESSAGES_ENDPOINT,
   },
   anthropic: {
     defaultModel: env.DEFAULT_CLAUDE_MODEL,
     exposeAllModels: env.EXPOSE_ALL_COPILOT_MODELS === 'true',
     modelSelection: env.MODEL_SELECTION,
+    upstreamMode: env.ANTHROPIC_UPSTREAM_MODE,
     unsupportedFeatures: env.UNSUPPORTED_FEATURES,
     maxOutputTokens: env.MAX_OUTPUT_TOKENS,
     streamUpstream: env.ENABLE_UPSTREAM_STREAMING === 'true',

@@ -11,24 +11,25 @@ An **Anthropic Messages API-compatible** proxy that lets **Claude Code** run on 
 
 ## ✨ What works
 
-The proxy translates the core Anthropic workflows that Claude Code exercises.
+The proxy prefers Copilot's **native Anthropic Messages API** when the account's
+live catalog advertises it. The older OpenAI chat translator remains a fallback.
 It does **not** promise the same model build, reasoning quality, caching, quotas,
 or latency as `api.anthropic.com`.
 
 | Capability | Status | Notes |
 |---|---|---|
-| `POST /v1/messages` (buffered) | ✅ | Full request/response translation |
-| `POST /v1/messages` (streaming) | ✅ | True SSE pass-through from Copilot, not simulated |
-| **Tool calling** | ✅ | `tools`, `tool_choice`, `tool_use` ⇄ `tool_calls`, `tool_result` ⇄ `role: tool` |
-| **Streamed tool calls** | ✅ | All choices are merged; interleaved tools are serialized into valid content blocks |
-| **Images** | ✅ | `base64` / `url` image blocks → data URIs, with `Copilot-Vision-Request` |
-| **System prompts** | ✅ | Both the `string` and the block-array form Claude Code sends |
-| Sampling parameters | ✅ | `temperature`, `top_p`, `stop_sequences`, `max_tokens` |
-| `POST /v1/messages/count_tokens` | ✅ | Local estimate, calibrated from authoritative upstream usage |
+| `POST /v1/messages` (buffered) | ✅ | Native payload/response fields preserved; translation only in chat mode |
+| `POST /v1/messages` (streaming) | ✅ | Native SSE frames forwarded, including thinking/signature and future deltas |
+| **Tool calling** | ✅ | Native tool definitions, IDs, inputs, choices, and history retained |
+| **Streamed tool calls** | ✅ | Native lifecycle retained; chat fallback serializes interleaved tool fragments |
+| **Images** | ✅ | Native image blocks, including nested tool-result images, are preserved |
+| **System prompts** | ✅ | Native strings, blocks, and cache boundaries preserved |
+| Sampling parameters | ✅ | Native request values forwarded without heuristic budget changes |
+| `POST /v1/messages/count_tokens` | ✅ | Provider counting in native mode; labelled local estimate in chat mode |
 | `GET /v1/models`, `GET /v1/models/:model` | ✅ | Anthropic pagination envelope |
 | Error semantics | ✅ | Upstream status codes and Anthropic error types are preserved |
-| Prompt caching (`cache_control`) | ➖ | No verified equivalent; warned about by default, optionally rejected |
-| Extended thinking | ➖ | No verified equivalent; warned about by default, optionally rejected |
+| Prompt caching (`cache_control`) | ✅ | Native markers and cache usage retained; eligibility remains upstream-controlled |
+| Extended thinking | ✅ | Native configuration, thinking blocks, and signatures retained |
 
 ### Fidelity and reliability controls
 
@@ -36,33 +37,88 @@ or latency as `api.anthropic.com`.
   available Copilot IDs and intentional family aliases. Unavailable dated/versioned
   IDs fail rather than selecting a different generation. Responses report the
   upstream model ID (or the resolved request ID if upstream omits it).
-- **Unsupported semantics are explicit.** `X-Proxy-Warnings` reports ignored
-  thinking, cache boundaries, `top_k`, metadata, output configuration, and reduced
-  output budgets. `UNSUPPORTED_FEATURES=reject` fails these requests before sending
-  them upstream. This mode may require disabling thinking/caching in the client;
-  it does not add support for those features.
+- **Native first, not guessed.** `ANTHROPIC_UPSTREAM_MODE=auto` selects native
+  routing only for Claude models advertising `/v1/messages`. `native` requires
+  support (or an explicit native endpoint); `chat` opts into translation.
+  A pinned `COPILOT_CHAT_ENDPOINT` retains chat routing in auto mode. Failed native
+  generations are never silently replayed through the translator.
+- **Native semantics stay native.** Only the resolved model identifier changes
+  in the request. Thinking, signatures, tools, images, cache markers, output
+  configuration and unknown future fields are preserved. `anthropic-version`
+  and `anthropic-beta` reach upstream; inbound client credentials do not.
+  Native output/context limits are enforced by the provider, not by a local
+  heuristic that can prematurely reject valid requests.
+- **Chat fallback losses are explicit.** In chat mode, `X-Proxy-Warnings` reports
+  discarded thinking/cache controls and other translation losses;
+  `UNSUPPORTED_FEATURES=reject` refuses these requests. These restrictions do not
+  disable features that the native API can handle.
 - **Model and token behavior is observable.** `X-Proxy-Resolved-Model` identifies
   the routed model, `X-Proxy-Actual-Model` reports the upstream response model,
-  and `X-Proxy-Token-Count` distinguishes heuristic from calibrated counts.
-  Published context windows also constrain the forwarded output budget before
-  an oversized request consumes a premium request.
-- **Streaming stays incremental for text.** Parallel tool fragments must sometimes
-  be buffered to preserve Anthropic's sequential block lifecycle. Buffering is
-  bounded; malformed or interrupted upstream streams fail instead of returning
-  fabricated tool arguments or successful partial replies.
+  `X-Proxy-Transport` identifies `native` or `chat`, and `X-Proxy-Token-Count`
+  identifies `upstream`, `heuristic`, or `calibrated` counting.
+- **Streaming stays incremental.** Native frames are not reconstructed or
+  rewritten. Chat translation may buffer parallel tools to maintain valid block
+  ordering. Both paths bound buffering and reject interrupted streams instead
+  of inventing tool arguments or a successful final event.
 - **Bounded requests.** Upstream deadlines include response bodies; disconnected
   clients cancel active generation, and SSE writes respect slow-client backpressure.
   Retries default to **off** to avoid duplicate premium usage. Opt-in retries apply
   only to explicit 429/502/503/504 responses, never a partially delivered stream.
-- **Estimates are not provider accounting.** `X-Proxy-Token-Count` is
-  `heuristic` until successful requests provide authoritative prompt usage, then
-  becomes `calibrated` for that model. No prompts are retained. Counts remain an
-  approximation rather than Anthropic billing or cache telemetry.
-  The dashboard is not Copilot premium-request, cache, quota, or billing telemetry.
+- **Provider counting replaces guesses where available.** Native counting calls
+  Copilot's `/v1/messages/count_tokens` rather than estimating locally. Native
+  cache-read/creation usage fields reach Claude Code unchanged. Chat estimates
+  remain approximate and can be substantially wrong after mixed workloads.
+  The dashboard counts cache tokens as input but is not a premium-request,
+  quota, or billing ledger.
 
 For reproducible model comparisons, choose a concrete ID from `/v1/models`, not
 `sonnet`/`opus`/`haiku` aliases, and use the opt-in benchmark below. Even matching
 model labels cannot establish identical serving configurations.
+
+### Alignment with official Claude Code and the installed client
+
+The [official Claude Code repository](https://github.com/anthropics/claude-code)
+contains distribution/support material, releases, plugins and examples, not a
+complete open-source checkout of the installed CLI. Compatibility is based on
+the [official gateway protocol](https://code.claude.com/docs/en/llm-gateway-protocol),
+the [Messages streaming contract](https://platform.claude.com/docs/en/build-with-claude/streaming),
+and direct testing of the installed client, rather than transplanting CLI code.
+Microsoft's [Copilot Chat implementation](https://github.com/microsoft/vscode-copilot-chat/blob/main/src/platform/endpoint/node/chatEndpoint.ts)
+also selects native Messages based on advertised model capabilities. This is
+implementation evidence, not a stable public GitHub API availability guarantee.
+
+The 2026-09-12 comparison used installed **Claude Code 2.1.268** and
+`claude-sonnet-5`. Public Claude Code `main` had already reached 2.1.269; settings
+introduced there must not be assumed to work in 2.1.268. Keep the local client
+version and chosen model fixed for comparisons. Follow the official
+[gateway connection](https://code.claude.com/docs/en/llm-gateway-connect) and
+[model configuration](https://code.claude.com/docs/en/model-config) guidance:
+`ANTHROPIC_BASE_URL` changes the destination, not the model or its context limit.
+Use a real catalog ID and do not claim 1M context from a model label alone.
+
+| Area | Earlier chat-only route | Native route observed on the tested account |
+|---|---|---|
+| Prompt/history structure | Flattened/reordered content | Native JSON retained except explicit model resolution |
+| Thinking | Removed | Real thinking/signature returned; signed-history continuation succeeded |
+| Image tool results | Omitted from tool messages | Installed Claude Code read a synthetic PNG and answered its color |
+| Cache semantics | Markers discarded | 11,013 cache-creation tokens followed by 11,013 cache-read tokens |
+| Large-context count | 14,830 estimated vs 8,028 upstream | 8,028 returned unchanged; code, Unicode and tool counts also matched |
+| Installed client | Basic text/Read checks | Text, Read, streamed reasoning and image-Read workflows succeeded |
+| Same-backend text latency | No native-route comparison | Two paired trials added 29 ms and 36 ms versus direct Copilot native |
+
+These observations are **not comparisons against `api.anthropic.com`**: a direct
+Anthropic API key was unavailable. The timing sample is too small for a latency
+guarantee. Provider token counting is itself an estimate, as described in the
+[token-counting documentation](https://platform.claude.com/docs/en/build-with-claude/token-counting).
+One reasoning response used markdown around the correct numeric answer; it was
+preserved, not silently reformatted. Native forwarding reduces proxy-induced
+differences but cannot make model serving, quotas, output randomness or billing
+identical between GitHub and Anthropic.
+
+Native counting availability is separate from Messages support. Successful
+counts are labelled `upstream`; counting errors remain upstream errors rather
+than becoming apparently authoritative local estimates. The explicit chat
+fallback still has the documented heuristic-counting and feature limitations.
 
 ## 📖 Contents
 
@@ -478,7 +534,9 @@ GitHub bills Copilot usage in **premium requests**, and each model carries a mul
 
 - Use **Sonnet** as the main model and reserve **Opus** for hard problems (`/model opus`) — Opus costs several times more per request.
 - Keep a cheap model for Claude Code's background work (conversation summaries, titles) via `ANTHROPIC_SMALL_FAST_MODEL`.
-- `count_tokens` is answered locally, so Claude Code's frequent context-size checks cost nothing.
+- Native `count_tokens` uses the provider's counting endpoint without requesting
+  generation; chat mode uses a local estimate. Counting latency includes an
+  upstream round trip in native mode.
 - Use `/compact` and `/clear` regularly: fewer, larger turns cost less than many small ones, because billing is per request rather than per token.
 
 ### Optional: GPT and Gemini models
@@ -513,26 +571,26 @@ To switch back to normal Cursor behaviour, turn off the base URL override.
 ```
 ┌─────────────────┐     ┌────────────────────────────┐     ┌──────────────────────┐
 │   Claude Code   │────▶│    Copilot Proxy Server    │────▶│  GitHub Copilot API  │
-│ (Anthropic API) │     │                            │     │ (OpenAI-style chat)  │
+│ (Anthropic API) │     │                            │     │ (native + chat APIs) │
 │                 │◀────│  • OAuth device flow       │◀────│  • claude-opus-5     │
-└─────────────────┘ SSE │  • Messages ⇄ chat         │ SSE │  • claude-sonnet-5   │
-                        │  • Tools ⇄ tool_calls      │     │  • claude-haiku-4.5  │
+└─────────────────┘ SSE │  • Native Messages         │ SSE │  • claude-sonnet-5   │
+                        │  • Chat fallback           │     │  • claude-haiku-4.5  │
                         │  • SSE ⇄ SSE               │     └──────────────────────┘
                         └────────────────────────────┘
 ```
 
 1. The proxy runs the GitHub OAuth device flow and exchanges the GitHub token for a Copilot token, refreshing it before expiry.
 2. Claude Code posts Anthropic Messages API requests to `/v1/messages`.
-3. `anthropic-service.ts` translates the request into Copilot's chat-completions dialect: system blocks are flattened, `tool_result` blocks are re-ordered into standalone `tool` messages, images become data URIs, and tool schemas become function definitions.
-4. The upstream SSE stream is converted back into Anthropic events (`message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`) as it arrives.
-5. Upstream failures are surfaced with their original status code and the matching Anthropic error type, so Claude Code's retry logic behaves correctly.
+3. The live catalog determines whether the resolved model advertises native `/v1/messages`. `native-anthropic.ts` forwards that protocol with only model resolution and Copilot authentication/identity headers changed.
+4. Native response fields and SSE frames are preserved, including thinking/signatures and cache accounting. Otherwise `anthropic-service.ts` performs the documented, explicitly lossy chat-completions translation.
+5. Native failures preserve HTTP status, error body, request IDs and retry guidance. A native failure never automatically triggers a second generation using chat mode.
 
 ### Endpoints
 
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/messages` | Anthropic Messages API (also at `/anthropic/v1/messages`) |
-| `POST /v1/messages/count_tokens` | Adaptive local input-token estimate |
+| `POST /v1/messages/count_tokens` | Native provider count or labelled chat-mode estimate |
 | `GET /v1/models`, `GET /v1/models/:model` | Model discovery |
 | `POST /openai/v1/chat/completions` | OpenAI-compatible surface for Cursor |
 | `GET /health` | Health check |
@@ -547,7 +605,7 @@ src/
 ├── middleware/   Rate limiting, request logging, error handling
 ├── public/       Auth portal and usage dashboard
 ├── routes/       anthropic.ts (Claude Code), openai.ts (Cursor), auth.ts, usage.ts
-├── services/     anthropic-service.ts (translation), auth-service.ts, copilot-service.ts
+├── services/     native-anthropic.ts, anthropic-service.ts (chat translation), auth-service.ts
 ├── types/        anthropic.ts, copilot-chat.ts, openai.ts, github.ts
 └── utils/        model-mapper.ts, logger.ts, machine-id.ts
 ```
@@ -564,14 +622,16 @@ All settings are optional; see [`.env.example`](.env.example) for the full list.
 | `JSON_BODY_LIMIT` | `10mb` | Maximum parsed JSON body; raise deliberately for larger images/contexts |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug` |
 | `COPILOT_CHAT_ENDPOINT` | *(from your Copilot token)* | Pin a GitHub Enterprise host or corporate proxy. Leave unset to use the account-specific host GitHub advertises, e.g. `api.individual.githubcopilot.com`. |
+| `COPILOT_MESSAGES_ENDPOINT` | *(from your Copilot token)* | Explicit native Messages URL, including `/v1/messages`; counts use its `/count_tokens` subpath |
 | `COPILOT_INTEGRATION_ID` | `vscode-chat` | Client identity required by Copilot |
 | `COPILOT_EDITOR_VERSION` / `COPILOT_PLUGIN_VERSION` / `COPILOT_USER_AGENT` | vscode defaults | Client identity headers |
 | `DEFAULT_CLAUDE_MODEL` | `claude-sonnet-5` | Fallback for unknown Claude models in compatible mode |
 | `MODEL_SELECTION` | `strict` | Reject version substitutions; `compatible` opts into legacy alias retargeting |
-| `UNSUPPORTED_FEATURES` | `warn` | Warn through response headers, or `reject` requests needing unsupported semantics |
+| `ANTHROPIC_UPSTREAM_MODE` | `auto` | Prefer advertised native Messages; `native` requires it, `chat` forces the legacy translator |
+| `UNSUPPORTED_FEATURES` | `warn` | In chat mode, warn or `reject` requests requiring unpreservable semantics |
 | `EXPOSE_ALL_COPILOT_MODELS` | `false` | Also advertise non-Claude models (GPT, Gemini) on `/v1/models` |
-| `MAX_OUTPUT_TOKENS` | `64000` | Ceiling applied to `max_tokens` (the model's own limit wins when lower) |
-| `ENABLE_UPSTREAM_STREAMING` | `true` | Set to `false` to buffer upstream responses |
+| `MAX_OUTPUT_TOKENS` | `64000` | Chat-mode output ceiling; native mode forwards the original budget for provider validation |
+| `ENABLE_UPSTREAM_STREAMING` | `true` | Chat-mode streaming toggle; native mode preserves the client's `stream` value |
 | `UPSTREAM_TIMEOUT_MS` | `300000` | Per-fetch deadline through body consumption, including retries |
 | `UPSTREAM_MAX_RETRIES` | `0` | Opt-in bounded retries for explicit transient HTTP failures (maximum 3) |
 | `UPSTREAM_SAFE_GET_RETRIES` | `2` | Retries for idempotent Copilot token/catalog GETs |
@@ -611,14 +671,15 @@ per-user isolation, or a production security guarantee.
 ## 🛠️ Development
 
 ```bash
-npm run dev        # Run from source with the ts-node ESM loader
+npm run dev        # Run source with the fast ts-node ESM transpiler
 npm run typecheck  # tsc --noEmit
 npm run lint       # ESLint
 npm test           # Jest
 npm run build      # Compile to dist/
 ```
 
-`npm run dev` runs directly from source; restart it after edits. The packaged
+`npm run dev` runs directly from source without ts-node's startup type-checking;
+run `npm run typecheck` separately (CI still requires it). Restart after edits. The packaged
 `claudecode-copilot-proxy start` command runs the compiled `dist` entrypoint
 and supports native Windows paths.
 

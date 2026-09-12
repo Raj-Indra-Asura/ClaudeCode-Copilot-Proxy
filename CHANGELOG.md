@@ -3,6 +3,16 @@
 ## [Unreleased]
 
 ### Added
+- **Native Anthropic routing.** Auto mode uses `/v1/messages` when the account's
+  model catalog advertises it. Thinking/signatures, nested tool-result images,
+  cache markers/usage, native SSE frames and beta/version headers are preserved.
+  `ANTHROPIC_UPSTREAM_MODE=chat` retains the older translator; `native` requires
+  native support. Failed native generations are never replayed in chat mode.
+- **Provider token counting.** Native routing uses `/v1/messages/count_tokens`,
+  removing heuristic context rejection and counting errors from that path.
+  Chat-only fallback estimates remain approximate.
+- Native gateway contract tests for transparent fields/frames, count requests,
+  cache usage, errors, cancellation, buffer limits and body-read deadlines.
 - **Live model discovery.** `GET /v1/models` now reflects the signed-in account's real
   Copilot catalog (`GET {endpoints.api}/models`, cached for 10 minutes), so every Claude
   model the plan includes is selectable from Claude Code instead of a hardcoded subset.
@@ -10,7 +20,7 @@
 - **Catalog-aware model resolution.** Any live model ID is forwarded verbatim, and an
   alias whose mapped target is not in the account's catalog is retargeted to the newest
   live model of the same family instead of failing with `model_not_supported`.
-- **Per-model output limits.** `max_tokens` is clamped to the model's published
+- **Per-model chat output limits.** Chat-mode `max_tokens` is clamped to the model's published
   `max_output_tokens` when it is lower than `MAX_OUTPUT_TOKENS`.
 - `EXPOSE_ALL_COPILOT_MODELS` to also advertise non-Claude models (GPT, Gemini).
 - **Tool calling** for Claude Code: Anthropic `tools` / `tool_choice` are translated to
@@ -63,6 +73,11 @@
 - Cursor IDE base URL documented as `/openai/v1`, matching where the routes are mounted.
 
 ### Changed
+- Native mode leaves output/context budget validation to the provider.
+  `MAX_OUTPUT_TOKENS`, `UNSUPPORTED_FEATURES` and `ENABLE_UPSTREAM_STREAMING`
+  retain their existing meaning for the chat fallback only.
+- Development startup uses the transpile-only ESM loader to avoid slow inline
+  ts-node type-checking; the separate `typecheck` and build quality gates remain.
 - Minimum supported Node.js version is now 20; CI runs on Node 20 and 22 and the Docker
   image is based on Node 22.
 - Model mapping resolves the longest matching prefix and falls back to
@@ -82,4 +97,3 @@
 - Web-based authentication UI
 - Environment variable configuration with Zod validation
 - Enhanced .gitignore with additional standard entries
-
