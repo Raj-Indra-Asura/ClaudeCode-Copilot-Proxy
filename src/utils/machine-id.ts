@@ -1,6 +1,5 @@
 import { networkInterfaces } from 'os';
 import crypto from 'crypto';
-import { v4 as uuidv4 } from 'uuid';
 import { logger } from './logger.js';
 
 let cachedMachineId: string | undefined;
@@ -35,11 +34,11 @@ export function getMachineId(): string {
     
     // No valid MAC address found, fall back to UUID
     logger.warn('No valid MAC address found for machine ID, using UUID instead');
-    cachedMachineId = uuidv4();
+    cachedMachineId = crypto.randomUUID();
     return cachedMachineId;
   } catch (error) {
     logger.error('Error generating machine ID:', error);
-    cachedMachineId = uuidv4();
+    cachedMachineId = crypto.randomUUID();
     return cachedMachineId;
   }
 }

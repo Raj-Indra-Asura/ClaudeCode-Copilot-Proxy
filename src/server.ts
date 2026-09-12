@@ -28,9 +28,17 @@ app.use(express.json({ limit: config.server.bodyLimit }));
 // Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Health check endpoint
+// Health check endpoint (process liveness only, not authentication state)
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'healthy' });
+  res.status(200).json({ status: 'healthy', version: config.version });
+});
+
+// Claude Code sends a best-effort HEAD probe to its gateway base URL on startup.
+app.all('/api/hello', (req, res) => {
+  if (req.method !== 'HEAD' && req.method !== 'GET') {
+    return res.status(405).end();
+  }
+  return res.status(200).end();
 });
 
 // Routes

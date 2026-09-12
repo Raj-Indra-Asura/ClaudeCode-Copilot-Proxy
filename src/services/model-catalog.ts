@@ -21,6 +21,9 @@ import { logger } from '../utils/logger.js';
 /** How long a fetched catalog is considered fresh. */
 const CATALOG_TTL_MS = 10 * 60 * 1000;
 
+/** Minimum spacing between catalog fetch attempts after a failure. */
+const CATALOG_RETRY_MS = 30 * 1000;
+
 /** A chat model offered by the signed-in Copilot account. */
 export interface CatalogModel {
   id: string;
@@ -71,6 +74,7 @@ interface RawCopilotModel {
 
 let catalog: CatalogModel[] = [];
 let fetchedAt = 0;
+let lastAttemptAt = 0;
 let inFlight: Promise<CatalogModel[]> | null = null;
 
 /**
@@ -172,8 +176,10 @@ export function getCatalogOutputLimit(id: string): number | undefined {
 /**
  * Fetch the catalog, reusing the cached copy while it is fresh.
  *
- * Never rejects: on failure the previous snapshot is returned so a transient
- * upstream error cannot empty Claude Code's model list.
+ * A stale snapshot is returned immediately while a single background refresh
+ * replaces it, so no Claude Code request pays the catalog round trip. Only a
+ * cold start with no snapshot waits. Never rejects: on failure the previous
+ * snapshot is kept and the next attempt is delayed.
  */
 export async function refreshModelCatalog(
   options: { force?: boolean; signal?: AbortSignal } = {}
@@ -181,15 +187,25 @@ export async function refreshModelCatalog(
   if (options.signal?.aborted) {
     throw options.signal.reason;
   }
-  const isFresh = catalog.length > 0 && Date.now() - fetchedAt < CATALOG_TTL_MS;
+  const now = Date.now();
+  const isFresh = catalog.length > 0 && now - fetchedAt < CATALOG_TTL_MS;
   if (!options.force && isFresh) {
     return catalog;
   }
-
-  if (!inFlight) {
+  // Unauthenticated: nothing to fetch yet, and this must not start a backoff.
+  if (!getCopilotToken()?.token) {
+    return catalog;
+  }
+  const backingOff = !options.force && lastAttemptAt > fetchedAt &&
+    now - lastAttemptAt < CATALOG_RETRY_MS;
+  if (!inFlight && !backingOff) {
+    lastAttemptAt = now;
     inFlight = fetchCatalog().finally(() => {
       inFlight = null;
     });
+  }
+  if (!inFlight || (!options.force && catalog.length > 0)) {
+    return catalog;
   }
 
   if (!options.signal) {
@@ -278,8 +294,9 @@ export function primeModelCatalog(): void {
   void refreshModelCatalog();
 }
 
-/** Test hook: replace or clear the cached catalog. */
-export function setCatalogForTesting(models: CatalogModel[]): void {
+/** Test hook: replace or clear the cached catalog, optionally marking it stale. */
+export function setCatalogForTesting(models: CatalogModel[], ageMs = 0): void {
   catalog = models;
-  fetchedAt = models.length > 0 ? Date.now() : 0;
+  fetchedAt = models.length > 0 ? Date.now() - ageMs : 0;
+  lastAttemptAt = 0;
 }

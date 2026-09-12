@@ -162,7 +162,7 @@ describe('proxy access control', () => {
     const app = express().use(accessControl({ ...options, authToken: token })).use(serverApp);
     const response = await request(app).get(path);
     expect(response.status).toBe(200);
-    if (path === '/health') expect(response.body).toEqual({ status: 'healthy' });
+    if (path === '/health') expect(response.body).toMatchObject({ status: 'healthy' });
     else expect(response.text).toContain('proxy-token-form');
     expect((await request(app).head(path)).status).toBe(200);
     expect((await request(app).post(path)).status).toBe(401);

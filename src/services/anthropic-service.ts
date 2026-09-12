@@ -9,9 +9,8 @@
  */
 
 import { Response } from 'node-fetch';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { TextDecoder } from 'node:util';
-import { v4 as uuidv4 } from 'uuid';
 import { config } from '../config/index.js';
 import { getCopilotToken } from './auth-service.js';
 import {
@@ -1375,5 +1374,5 @@ export function createAnthropicError(
  * Generate a message ID in Anthropic's format.
  */
 export function generateMessageId(): string {
-  return `msg_${uuidv4().replace(/-/g, '').substring(0, 24)}`;
+  return `msg_${randomUUID().replace(/-/g, '').substring(0, 24)}`;
 }

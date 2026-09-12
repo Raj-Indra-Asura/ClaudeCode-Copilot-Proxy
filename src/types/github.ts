@@ -32,23 +32,3 @@ export interface AuthenticationStatus {
   expiresAt?: number;
   error?: string;
 }
-
-export interface CopilotCompletionChoice {
-  text: string;
-  index: number;
-  logprobs: null;
-  finish_reason: string | null;
-}
-
-export interface CopilotCompletionResponse {
-  id: string;
-  object: string;
-  created: number;
-  model: string;
-  choices: CopilotCompletionChoice[];
-  usage?: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  }
-}

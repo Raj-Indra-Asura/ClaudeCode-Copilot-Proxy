@@ -33,6 +33,36 @@ export function destroyUpstreamBody(response: Response): void {
   (response.body as Readable | null)?.destroy();
 }
 
+/**
+ * Discard the remainder of a logically complete body so the TLS connection
+ * returns to the keep-alive pool. Destroying it instead forces every following
+ * request to pay a new handshake. The fetch deadline still bounds the drain.
+ */
+export function drainUpstreamBody(response: Response): void {
+  const body = response.body as Readable | null;
+  if (!body || body.destroyed || body.readableEnded) {
+    return;
+  }
+  body.on('error', () => undefined);
+  body.resume();
+}
+
+/**
+ * Upstream headers safe to relay to clients: request correlation, retry
+ * guidance and rate-limit telemetry. Cookies, content framing and hop-by-hop
+ * headers are deliberately excluded.
+ */
+export function forwardableUpstreamHeaders(response: Response): Record<string, string> {
+  const headers: Record<string, string> = {};
+  response.headers.forEach((value, name) => {
+    if (['request-id', 'x-request-id', 'retry-after', 'retry-after-ms'].includes(name) ||
+        name.startsWith('anthropic-ratelimit-') || name.startsWith('x-ratelimit-')) {
+      headers[name] = value;
+    }
+  });
+  return headers;
+}
+
 function retryDelay(response: Response, attempt: number): number {
   const value = response.headers.get('retry-after');
   if (value !== null) {

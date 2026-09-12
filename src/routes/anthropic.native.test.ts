@@ -210,8 +210,12 @@ describe('native Anthropic gateway contracts', () => {
       + frame('content_block_start', { index: 1, content_block: { type: 'text', text: '' } })
       + frame('content_block_delta', { index: 1, delta: { type: 'text_delta', text: 'NATIVE_OK' } })
       + frame('content_block_stop', { index: 1 }) + end();
+    let upstreamClosed = false;
+    let finishUpstream!: () => void;
     complete = (_req, res) => {
       res.setHeader('Content-Type', 'text/event-stream');
+      res.on('close', () => { upstreamClosed = true; });
+      finishUpstream = () => res.end();
       for (const byte of Buffer.from(sse)) res.write(Buffer.from([byte]));
       // Deliberately keep the connection open after message_stop.
     };
@@ -219,6 +223,10 @@ describe('native Anthropic gateway contracts', () => {
     expect(response.status).toBe(200);
     expect(response.text).toBe(sse);
     expect(getUsage(session)).toMatchObject({ requestCount: 1, tokenCount: 165 });
+    // A graceful stop must drain, not destroy, so the keep-alive socket stays reusable.
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(upstreamClosed).toBe(false);
+    finishUpstream();
   });
 
   it('preserves upstream error status/body and retry guidance without forwarding cookies', async () => {
@@ -235,6 +243,18 @@ describe('native Anthropic gateway contracts', () => {
     expect(response.headers['set-cookie']).toBeUndefined();
     expect(paths.filter(value => value === '/v1/messages')).toHaveLength(1);
     expect(paths).not.toContain('/chat/completions');
+  });
+
+  it('wraps plain-text upstream errors in the Anthropic envelope with the real status', async () => {
+    complete = (_req, res) => {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Bad Request\n');
+    };
+    const response = await request(downstream).post('/v1/messages').send(payload);
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({
+      type: 'error', error: { type: 'invalid_request_error', message: 'Bad Request' },
+    });
   });
 
   it('preserves signature-only thinking, redacted content and partial tool JSON', async () => {

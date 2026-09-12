@@ -552,9 +552,15 @@ Any other model your Copilot plan exposes is passed through untouched:
 Cursor speaks the OpenAI API rather than Anthropic's, so it uses a different
 base URL on the same running proxy.
 
-**Legacy/experimental:** this path still uses prompt-flattened code completions,
-not modern chat/tool/image semantics. The Claude Code improvements do not imply
-full Cursor or OpenAI compatibility.
+Requests are relayed to Copilot's own OpenAI-compatible chat endpoint with only
+the model resolved and Copilot identity headers added; tools, images, streaming
+frames and usage pass through unchanged. `GET /openai/v1/models` lists every
+model Copilot serves through that endpoint (GPT-4.1/5.4, Gemini, Claude, ...).
+Models Copilot serves only through its `/responses` API (for example `gpt-5.5`)
+are omitted and rejected with a clear 400 before any request is spent. The
+deprecated `max_tokens` field is renamed to `max_completion_tokens` when the
+modern field is absent, because Copilot rejects the old one for GPT-5.x
+(`X-Proxy-Warnings: max_tokens_renamed`).
 
 1. Complete Steps 1–6 above so the proxy is running and authenticated.
 2. Open Cursor IDE → **Settings** → **API Keys**.
@@ -704,8 +710,30 @@ Inspect the emitted JSON, not just Jest's exit status: live task mismatches are
 reported rather than asserted. The report separates contract/task success from
 first-fragment and total latency. Synthetic expected-output matches do not
 establish general coding quality, thinking/cache parity, or identical models.
-The OpenAI/Cursor path remains legacy/experimental and is not covered by the
-Anthropic A/B comparison.
+The OpenAI/Cursor relay is not covered by the Anthropic A/B comparison.
+
+### Measuring the proxy's own overhead
+
+Without a direct Anthropic key you can still measure what the proxy adds on top
+of Copilot's native endpoint (same account, model and prompts):
+
+```powershell
+npm run build
+$env:PROXY_URL = 'http://localhost:3000'   # set PROXY_AUTH_TOKEN too if configured
+$env:SAMPLES = '6'
+node scripts/measure-proxy-overhead.mjs
+```
+
+It reports p50/mean totals for `count_tokens`, buffered and streamed messages
+on both paths plus the paired difference, and prints timings only. The
+2026-09-12 run (6 paired samples, `claude-sonnet-5`) measured paired p50
+overheads of −105 ms, −36 ms and +17 ms respectively — within network jitter.
+Before the keep-alive fix in this release, every request following a streamed
+message paid a fresh TLS handshake (~800 ms); that is what the script exists to
+catch.
+
+See [`AUDIT.md`](AUDIT.md) for the full audit trail: original findings,
+what changed, measurements and residual limitations.
 
 ## 🩺 Troubleshooting
 

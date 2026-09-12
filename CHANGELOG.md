@@ -3,6 +3,23 @@
 ## [Unreleased]
 
 ### Added
+- **Keep-alive-preserving SSE relay.** Ending a streamed response used to destroy
+  the upstream socket, so every following request (Claude Code's `count_tokens`,
+  the next message) paid a fresh TLS handshake (~800 ms measured). Graceful
+  completion now drains the body and returns the connection to the pool; only
+  client disconnects and errors cancel upstream.
+- **Cursor/OpenAI relay rebuilt.** `/openai/v1/chat/completions` forwards to
+  Copilot's OpenAI-compatible chat endpoint (tools, images, streaming, usage
+  preserved) instead of the retired codex completions endpoint; `/openai/v1/models`
+  lists the live catalog filtered to chat-capable models; `/responses`-only models
+  fail fast with a clear 400; deprecated `max_tokens` is renamed to
+  `max_completion_tokens` when absent.
+- **Stale-while-revalidate model catalog** with failure backoff: requests never
+  wait for a catalog refresh once a snapshot exists.
+- **Proactive Copilot token refresh** ten minutes before expiry, off the request path.
+- `HEAD /api/hello` answers Claude Code's gateway startup probe; `/health` reports the version.
+- `scripts/measure-proxy-overhead.mjs` measures proxy-vs-direct-Copilot latency.
+- `AUDIT.md` final audit report.
 - **Native Anthropic routing.** Auto mode uses `/v1/messages` when the account's
   model catalog advertises it. Thinking/signatures, nested tool-result images,
   cache markers/usage, native SSE frames and beta/version headers are preserved.
@@ -73,6 +90,10 @@
 - Cursor IDE base URL documented as `/openai/v1`, matching where the routes are mounted.
 
 ### Changed
+- Plain-text upstream errors (Copilot answers some 4xx as `text/plain`) keep their
+  real status inside the Anthropic/OpenAI error envelope instead of becoming 502s.
+- Dependencies `uuid`, `cors` and `@microsoft/fetch-event-source` removed
+  (`node:crypto.randomUUID` replaces `uuid`); `npm audit --omit=dev` is clean.
 - Native mode leaves output/context budget validation to the provider.
   `MAX_OUTPUT_TOKENS`, `UNSUPPORTED_FEATURES` and `ENABLE_UPSTREAM_STREAMING`
   retain their existing meaning for the chat fallback only.

@@ -1,15 +1,19 @@
 import { Response } from 'node-fetch';
-import { TextDecoder } from 'node:util';
 import { config } from '../config/index.js';
 import { AnthropicCountTokensRequest, AnthropicMessageRequest } from '../types/anthropic.js';
 import { buildCopilotHeaders } from '../utils/copilot-headers.js';
 import { RequestCompatibilityError } from '../utils/request-policy.js';
-import { destroyUpstreamBody, upstreamAbortReason, upstreamFetch } from '../utils/upstream-fetch.js';
+import { createSseRelay, SseRelayError } from '../utils/sse-relay.js';
+import {
+  destroyUpstreamBody,
+  forwardableUpstreamHeaders,
+  upstreamAbortReason,
+  upstreamFetch,
+} from '../utils/upstream-fetch.js';
 import { getCopilotToken } from './auth-service.js';
-import { CopilotApiError } from './anthropic-service.js';
+import { CopilotApiError, mapStatusToAnthropicErrorType } from './anthropic-service.js';
 import { findCatalogModel } from './model-catalog.js';
 
-const MAX_FRAME_BYTES = 1024 * 1024;
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const TOKEN_FIELDS = [
   'input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens',
@@ -91,26 +95,33 @@ export async function postNativeAnthropic(
   });
 }
 
-export function nativeResponseHeaders(response: Response): Record<string, string> {
-  const headers: Record<string, string> = {};
-  response.headers.forEach((value, name) => {
-    if (['request-id', 'x-request-id', 'retry-after', 'retry-after-ms'].includes(name) ||
-        name.startsWith('anthropic-ratelimit-')) {
-      headers[name] = value;
-    }
-  });
-  return headers;
-}
+export const nativeResponseHeaders = forwardableUpstreamHeaders;
 
 export async function readNativeJson(response: Response): Promise<Record<string, unknown>> {
+  let text: string;
   try {
-    const value: unknown = await response.json();
-    if (isJsonObject(value)) return value;
+    text = await response.text();
   } catch {
     throw upstreamAbortReason(response) ??
       new CopilotApiError(502, 'Copilot returned an invalid or incomplete native response');
   } finally {
     destroyUpstreamBody(response);
+  }
+  try {
+    const value: unknown = JSON.parse(text);
+    if (isJsonObject(value)) return value;
+  } catch {
+    // Handled below: Copilot sometimes answers 4xx with a plain-text body.
+  }
+  if (!response.ok) {
+    // Preserve the upstream status; wrap the text so Claude Code still gets its envelope.
+    return {
+      type: 'error',
+      error: {
+        type: mapStatusToAnthropicErrorType(response.status),
+        message: text.replace(/[^\x20-\x7e]/g, ' ').trim().slice(0, 500) || `Copilot returned HTTP ${response.status}`,
+      },
+    };
   }
   throw new CopilotApiError(502, 'Copilot returned an invalid native response');
 }
@@ -144,53 +155,38 @@ export interface NativeFrame {
 /**
  * Observe native events for usage/lifecycle only. Forward their original frame
  * rather than rebuilding content, so thinking, signatures and future deltas
- * survive unchanged. Stop at message_stop without waiting for connection EOF.
+ * survive unchanged. Stop at message_stop and keep the connection reusable.
  */
 export async function* nativeFrames(response: Response): AsyncGenerator<NativeFrame> {
-  if (!response.body) throw new CopilotApiError(502, 'Copilot returned an empty native stream');
-  const decoder = new TextDecoder('utf-8', { fatal: true });
-  let pending = '';
+  const relay = createSseRelay(response);
   try {
-    for await (const chunk of response.body) {
-      try {
-        pending += decoder.decode(typeof chunk === 'string' ? Buffer.from(chunk) : chunk, { stream: true });
-      } catch {
-        throw new CopilotApiError(502, 'Copilot returned invalid native stream encoding');
-      }
-      let boundary: RegExpExecArray | null;
-      while ((boundary = /\r\n\r\n|\n\n|\r\r/.exec(pending))) {
-        const end = boundary.index + boundary[0].length;
-        const raw = pending.slice(0, end);
-        pending = pending.slice(end);
-        if (Buffer.byteLength(raw) > MAX_FRAME_BYTES) {
-          throw new CopilotApiError(502, 'Copilot native stream event exceeded the buffer limit');
+    for await (const frame of relay.frames()) {
+      let event: Record<string, unknown> | undefined;
+      if (frame.data) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(frame.data);
+        } catch {
+          throw new CopilotApiError(502, 'Copilot returned malformed native stream data');
         }
-        const data = raw.split(/\r\n|\r|\n/).filter(line => line.startsWith('data:'))
-          .map(line => line.slice(5).replace(/^ /, '')).join('\n');
-        let event: Record<string, unknown> | undefined;
-        if (data) {
-          let parsed: unknown;
-          try {
-            parsed = JSON.parse(data);
-          } catch {
-            throw new CopilotApiError(502, 'Copilot returned malformed native stream data');
-          }
-          if (!isJsonObject(parsed) || typeof parsed.type !== 'string') {
-            throw new CopilotApiError(502, 'Copilot returned an invalid native event');
-          }
-          event = parsed;
+        if (!isJsonObject(parsed) || typeof parsed.type !== 'string') {
+          throw new CopilotApiError(502, 'Copilot returned an invalid native event');
         }
-        yield { raw, event };
-        if (event?.type === 'message_stop' || event?.type === 'error') return;
+        event = parsed;
       }
-      if (Buffer.byteLength(pending) > MAX_FRAME_BYTES) {
-        throw new CopilotApiError(502, 'Copilot native stream event exceeded the buffer limit');
+      const terminal = event?.type === 'message_stop' || event?.type === 'error';
+      if (terminal) {
+        relay.complete();
+      }
+      yield { raw: frame.raw, event };
+      if (terminal) {
+        return;
       }
     }
-    throw new CopilotApiError(502, 'Copilot native stream ended before message_stop');
   } catch (error) {
-    throw upstreamAbortReason(response) ?? error;
-  } finally {
-    destroyUpstreamBody(response);
+    if (error instanceof SseRelayError) {
+      throw new CopilotApiError(502, `Copilot native stream ${error.message}`);
+    }
+    throw error;
   }
 }

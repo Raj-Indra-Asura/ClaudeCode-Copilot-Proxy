@@ -38,7 +38,8 @@ This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get sta
 | `types/anthropic.ts` | Anthropic Messages API types | ✅ Implemented |
 | `types/copilot-chat.ts` | Copilot chat-completions (OpenAI dialect) types | ✅ Implemented |
 | `services/auth-service.ts` | GitHub OAuth device flow, token refresh | ✅ Implemented |
-| `routes/openai.ts` / `services/copilot-service.ts` | OpenAI-compatible surface for Cursor | ✅ Implemented |
+| `routes/openai.ts` | OpenAI-compatible relay for Cursor: forwards to Copilot's chat endpoint, endpoint-gated by the catalog | ✅ Implemented |
+| `utils/sse-relay.ts` | Byte-exact SSE frame relay; graceful completion drains (keep-alive) instead of destroying sockets | ✅ Implemented |
 
 ### API Mappings
 

@@ -5,7 +5,7 @@
  * model catalog can use them without a circular import.
  */
 
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'node:crypto';
 import { config } from '../config/index.js';
 import { getMachineId } from './machine-id.js';
 
@@ -23,7 +23,7 @@ export function buildCopilotHeaders(
     'Content-Type': 'application/json',
     Accept: options.stream ? 'text/event-stream' : 'application/json',
     Authorization: 'Bearer ' + copilotToken,
-    'X-Request-Id': uuidv4(),
+    'X-Request-Id': randomUUID(),
     'X-Github-Api-Version': '2025-05-01',
     'Machine-Id': getMachineId(),
     'Copilot-Integration-Id': config.copilot.integrationId,

@@ -7,7 +7,7 @@
  */
 
 import express from 'express';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'node:crypto';
 import {
   ensureCopilotToken,
   getCopilotToken,
@@ -239,7 +239,7 @@ anthropicRoutes.post('/messages/count_tokens', requireAuth, async (req, res) => 
 
 // POST /v1/messages - the main Claude Code endpoint
 anthropicRoutes.post('/messages', requireAuth, async (req, res) => {
-  const sessionId: string = res.locals.sessionId || uuidv4();
+  const sessionId: string = res.locals.sessionId || randomUUID();
   const request = req.body as AnthropicMessageRequest;
 
   const validationError = validateMessageRequest(request);
@@ -313,9 +313,12 @@ async function handleNativeMessage(
 ): Promise<void> {
   const upstream = await postNativeAnthropic(request, model, token, headers, signal);
   let usage: Record<string, unknown> = {};
+  // Once a reader owns the body it decides whether to drain (keep-alive) or destroy.
+  let bodyOwned = false;
   try {
     res.set(nativeResponseHeaders(upstream));
     if (!upstream.ok || !request.stream) {
+      bodyOwned = true;
       const body = await readNativeJson(upstream);
       if (signal.aborted || res.destroyed) return;
       if (upstream.ok) {
@@ -333,6 +336,7 @@ async function handleNativeMessage(
     }
     let started = false;
     let finished = false;
+    bodyOwned = true;
     for await (const frame of nativeFrames(upstream)) {
       if (signal.aborted || res.destroyed) return;
       const event = frame.event;
@@ -370,7 +374,7 @@ async function handleNativeMessage(
     const { body } = toAnthropicErrorResponse(error);
     if (await writeEvent(res, { type: 'error', error: body.error })) res.end();
   } finally {
-    destroyUpstreamBody(upstream);
+    if (!bodyOwned) destroyUpstreamBody(upstream);
     trackTokens(sessionId, nativeTokenTotal(usage));
   }
 }

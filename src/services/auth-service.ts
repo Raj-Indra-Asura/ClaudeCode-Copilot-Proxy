@@ -22,6 +22,9 @@ let tokenRefreshInterval: NodeJS.Timeout | null = null;
 // De-duplicates concurrent refreshes so a burst of Claude Code requests only
 // triggers a single call to GitHub.
 let refreshPromise: Promise<CopilotToken> | null = null;
+// Refresh this far ahead of expiry so no request ever waits on a token exchange.
+const PROACTIVE_REFRESH_WINDOW_S = 10 * 60;
+const AUTO_REFRESH_INTERVAL_MS = 60 * 1000;
 
 // Ensure token storage directory exists
 if (!fs.existsSync(TOKEN_STORAGE_DIR)) {
@@ -94,9 +97,9 @@ function startTokenAutoRefresh(): void {
     clearInterval(tokenRefreshInterval);
   }
   
-  // Check and refresh token every 5 minutes
+  // Refresh ahead of expiry, in the background, so requests never block on it.
   tokenRefreshInterval = setInterval(async () => {
-    if (githubToken && (!copilotToken || !isTokenValid())) {
+    if (githubToken && (!copilotToken || tokenExpiresWithin(PROACTIVE_REFRESH_WINDOW_S))) {
       try {
         logger.info('Auto-refreshing Copilot token...');
         await refreshCopilotToken();
@@ -104,7 +107,7 @@ function startTokenAutoRefresh(): void {
         logger.error('Auto-refresh failed');
       }
     }
-  }, 5 * 60 * 1000); // 5 minutes
+  }, AUTO_REFRESH_INTERVAL_MS);
   tokenRefreshInterval.unref?.();
   
   logger.info('Token auto-refresh started');
@@ -334,6 +337,14 @@ export function isTokenValid(): boolean {
   const now = Math.floor(Date.now() / 1000);
   // Reduced buffer from 60s to 5s to extend token usage time
   return now < (copilotToken.expires_at - 5);
+}
+
+/** True when the cached token expires within the given number of seconds. */
+export function tokenExpiresWithin(seconds: number): boolean {
+  if (!copilotToken?.token) {
+    return true;
+  }
+  return copilotToken.expires_at - Math.floor(Date.now() / 1000) < seconds;
 }
 
 /**
